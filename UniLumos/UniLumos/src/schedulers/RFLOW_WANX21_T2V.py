@@ -169,6 +169,10 @@ class RFLOW_WANX21_T2V:
         else:
             raise ValueError(f"Unknown sampler_mode: {sampler_mode}")
 
+        sampling_sigmas = np.asarray(sampling_sigmas, dtype=np.float64)
+        if base_sigmas is not None:
+            base_sigmas = np.asarray(base_sigmas, dtype=np.float64)
+
         timesteps, _ = retrieve_timesteps(self.scheduler, device=device, sigmas=sampling_sigmas, shift=1)
 
         if dump_schedule_json:
