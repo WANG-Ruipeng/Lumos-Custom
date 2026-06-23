@@ -85,6 +85,15 @@ def write_dry_run_report(path: Path, commands: list[tuple[str, list[str]]]) -> N
             handle.write("\n```\n\n")
 
 
+def tail_text(path: Path, max_lines: int = 120) -> str:
+    if not path.exists():
+        return f"{path} does not exist."
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if not lines:
+        return f"{path} is empty."
+    return "\n".join(lines[-max_lines:])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", required=True, type=Path)
@@ -144,6 +153,11 @@ def main() -> None:
             row["status"] = "failed"
             row["error_message"] = f"returncode={proc.returncode}; see {stderr_path}"
             write_manifest(args.manifest, rows)
+            print(f"Run failed: {row['run_id']}", file=sys.stderr)
+            print(f"stderr log: {stderr_path}", file=sys.stderr)
+            print(tail_text(stderr_path), file=sys.stderr)
+            print(f"stdout log: {stdout_path}", file=sys.stderr)
+            print(tail_text(stdout_path, max_lines=80), file=sys.stderr)
             raise SystemExit(proc.returncode)
         write_manifest(args.manifest, rows)
 
