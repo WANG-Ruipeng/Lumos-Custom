@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 
 try:
     from flash_attn import flash_attn_varlen_func
@@ -13,6 +14,59 @@ print(f'[PreInfo] Use flash attention={FLASH_VER}')
 __all__ = [
     'flash_attention',
 ]
+
+
+def _unflatten_varlen(x, lengths, max_len):
+    if bool(torch.all(lengths == max_len).item()):
+        return x.unflatten(0, (int(lengths.numel()), max_len))
+
+    padded = x.new_zeros((int(lengths.numel()), max_len, *x.shape[1:]))
+    offset = 0
+    for index, length in enumerate(lengths.tolist()):
+        if length:
+            padded[index, :length] = x[offset:offset + length]
+        offset += length
+    return padded
+
+
+def _sdpa_attention(q, k, v, q_lens, k_lens, lq, lk, softmax_scale, causal, dropout_p):
+    q = _unflatten_varlen(q, q_lens, lq)
+    k = _unflatten_varlen(k, k_lens, lk)
+    v = _unflatten_varlen(v, k_lens, lk)
+
+    nq, nk = q.size(2), k.size(2)
+    if nq != nk:
+        if nq % nk != 0:
+            raise ValueError(f"Query heads ({nq}) must be divisible by key/value heads ({nk}).")
+        repeat = nq // nk
+        k = k.repeat_interleave(repeat, dim=2)
+        v = v.repeat_interleave(repeat, dim=2)
+
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+
+    attn_mask = None
+    if not bool(torch.all(k_lens == lk).item()):
+        key_positions = torch.arange(lk, device=k.device)
+        attn_mask = key_positions[None, :] < k_lens[:, None]
+        attn_mask = attn_mask[:, None, None, :]
+
+    if causal and attn_mask is not None:
+        causal_mask = torch.ones((lq, lk), dtype=torch.bool, device=q.device).tril()
+        attn_mask = attn_mask & causal_mask[None, None, :, :]
+        causal = False
+
+    x = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=attn_mask,
+        dropout_p=dropout_p,
+        is_causal=causal,
+        scale=softmax_scale,
+    )
+    return x.transpose(1, 2).contiguous()
 
 
 def flash_attention(
@@ -76,7 +130,11 @@ def flash_attention(
     if q_scale is not None:
         q = q * q_scale
     # apply attention
-    if FLASH_VER == 3:
+    if FLASH_VER is None:
+        if window_size != (-1, -1):
+            raise NotImplementedError("PyTorch SDPA fallback only supports window_size=(-1, -1).")
+        x = _sdpa_attention(q, k, v, q_lens, k_lens, lq, lk, softmax_scale, causal, dropout_p)
+    elif FLASH_VER == 3:
         # Note: dropout_p, window_size are not supported in FA3 now.
         x = flash_attn_varlen_func(
             q=q,
