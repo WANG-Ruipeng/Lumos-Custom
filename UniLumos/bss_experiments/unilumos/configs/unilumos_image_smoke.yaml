@@ -1,0 +1,4 @@
+protocol: unilumos_official_image_smoke
+mode: image
+max_cases: 1
+reference_method: reference_uniform25

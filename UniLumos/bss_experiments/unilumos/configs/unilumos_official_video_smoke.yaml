@@ -1,0 +1,4 @@
+protocol: unilumos_official_protocol_smoke
+mode: abc
+max_cases: 1
+reference_method: reference_uniform25

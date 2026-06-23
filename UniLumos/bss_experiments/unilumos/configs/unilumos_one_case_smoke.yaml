@@ -1,0 +1,20 @@
+protocol: unilumos_official_protocol_smoke
+mode: abc
+max_cases: 1
+seed: 0
+sample_shift: 8.0
+methods:
+  - method: uniform8
+    sampler_mode: uniform
+    sample_steps: 8
+  - method: uniform10
+    sampler_mode: uniform
+    sample_steps: 10
+  - method: bss10
+    sampler_mode: bss
+    sample_steps: 10
+    base_sample_steps: 8
+    split_pairs: "0,-1"
+  - method: reference_uniform25
+    sampler_mode: uniform
+    sample_steps: 25

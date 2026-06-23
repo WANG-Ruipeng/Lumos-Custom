@@ -1,4 +1,10 @@
 import os
+import sys
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import argparse
 from pprint import pformat
 import torch
@@ -17,7 +23,11 @@ from src.datasets.datasets import LumosDataset
 from src.utils.utils_ import set_random_seed, save_sample
 from src.utils.misc import create_logger
 from src.encode_prompt import encode_prompt
-
+from bss_experiments.unilumos.adapters.unilumos_adapter import (
+    add_bss_sampler_args,
+    case_matches,
+    make_schedule_json_path,
+)
 def main(args):
 
     torch.set_grad_enabled(False)
@@ -33,7 +43,7 @@ def main(args):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)  # 如果是 cuda 设备
 
-    set_random_seed(seed=0)
+    set_random_seed(seed=args.seed)
 
     # == init logger ==
     logger = create_logger(None)
@@ -45,7 +55,7 @@ def main(args):
     # build model & load weights
     # ======================================================
 
-    logger.info("Building models...") 
+    logger.info("Building models...")
     logger.info("step 1: build text-encoder")
     text_encoder = WanX21T5Encoder(
             name='umt5_xxl',
@@ -59,9 +69,9 @@ def main(args):
     vae = WanX21_VAE(
         vae_pth=args.vae_path
     )
-    vae.model = vae.model.to(device=device, dtype=dtype).eval()         
+    vae.model = vae.model.to(device=device, dtype=dtype).eval()
 
-    logger.info("step 3: build wanx core model")    
+    logger.info("step 3: build wanx core model")
     model = Transformer().to(device=device, dtype=dtype).eval()
 
     # load model
@@ -106,14 +116,15 @@ def main(args):
     # ======================================================
     # inference
     # ======================================================
-    
+
     # == prepare arguments ==
     save_dir = args.save_dir
     os.makedirs(save_dir, exist_ok=True)
 
     model.eval()
+    processed_cases = 0
     with torch.no_grad():
-        for data_i in tqdm(dataloader, desc="Inference Progress", disable=not verbose):    
+        for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
 
             # Extract data from dataloader
             video_ref = data_i['video'].to(device, dtype)  # Reference video
@@ -128,11 +139,14 @@ def main(args):
             ori_path = data_i["ori_path"][0]
             bg_path_name = os.path.splitext(os.path.basename(bg_path))[0]
             base_name = os.path.splitext(os.path.basename(ori_path))[0]
-
+            if not case_matches(args, idx, base_name, bg_path_name):
+                continue
+            output_stem = os.path.join(save_dir, f"{base_name}_{bg_path_name}_gen")
+            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
             # Generate random noise
-            generator = torch.Generator(device=device).manual_seed(0)
+            generator = torch.Generator(device=device).manual_seed(args.seed)
             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
-            
+
             # Encode prompt, background, and degradation
             y = encode_prompt(
                 prompt=batch_prompts,
@@ -159,8 +173,16 @@ def main(args):
                 mask=None,
                 generator=generator,
                 mode="t2v",
-                sample_steps = 25, # sample_steps
-                sample_shift = 8.0, # sample_shift
+                sample_steps=args.sample_steps,
+                sample_shift=args.sample_shift,
+                sampler_mode=args.sampler_mode,
+                base_sample_steps=args.base_sample_steps,
+                split_pairs=args.split_pairs,
+                custom_sigmas=args.custom_sigmas,
+                dump_schedule_json=schedule_json_path,
+                method=args.method,
+                seed=args.seed,
+                output_path=output_stem,
             )
 
             samples = vae.decode(samples)
@@ -177,10 +199,13 @@ def main(args):
             save_sample(
                 video,
                 fps=args.fps,
-                save_path=f"{save_dir}/{base_name}_{bg_path_name}_gen",
+                save_path=output_stem,
                 verbose=verbose,
             )
-            
+            processed_cases += 1
+            if args.max_cases is not None and processed_cases >= args.max_cases:
+                break
+
             # # save original video
             # save_sample(
             #     v_ori,
@@ -211,10 +236,12 @@ if __name__ == "__main__":
     parser.add_argument("--image_size",  type=str,  default=(480, 832), help="image size")
     parser.add_argument("--num_frames",  type=int,  default=49, help="number of frames")
     parser.add_argument("--fps",  type=int,  default=12, help="fps")
-    
+
     parser.add_argument("--data_path",  type=str,  default="./examples/examples_refined.csv", help="path to data")
 
     parser.add_argument("--save_dir",  type=str,  default="./examples/results", help="path to save results")
+
+    add_bss_sampler_args(parser)
 
     args = parser.parse_args()
 

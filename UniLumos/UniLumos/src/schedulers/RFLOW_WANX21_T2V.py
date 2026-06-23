@@ -1,9 +1,21 @@
+import os
+import sys
 import torch
 import inspect
 from tqdm import tqdm
 import numpy as np
 from .rectified_flow import FlowDPMSolverMultistepScheduler
 
+_TASK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+if _TASK_ROOT not in sys.path:
+    sys.path.insert(0, _TASK_ROOT)
+
+from bss_experiments.unilumos.bss_core.grids import make_boundary_split_coords, parse_split_pairs
+from bss_experiments.unilumos.bss_core.schedule_io import (
+    build_schedule_payload,
+    dump_schedule_json as write_schedule_json,
+    load_custom_sigmas,
+)
 def get_sampling_sigmas(sampling_steps, shift):
     sigma = np.linspace(1, 0, sampling_steps+1)[:sampling_steps]
     sigma = (shift * sigma / (1 + (shift - 1) * sigma))
@@ -43,7 +55,7 @@ def retrieve_timesteps(
     else:
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
-    
+
     return timesteps, num_inference_steps
 
 class RFLOW_WANX21_T2V:
@@ -82,7 +94,7 @@ class RFLOW_WANX21_T2V:
 
         arg_c = {'context': context, 'seq_len': max_seq_len, 'x_deg': deg_latent, 'x_bg': bg_latent}
         arg_null = {'context': context_null, 'seq_len': max_seq_len, 'x_deg': deg_latent, 'x_bg': bg_latent}
-        
+
         return arg_c, arg_null
 
     def sample(
@@ -99,22 +111,85 @@ class RFLOW_WANX21_T2V:
         progress=True,
         mode="t2v",
         sample_steps=25,
-        sample_shift=8.0
-    ):  
+        sample_shift=8.0,
+        sampler_mode="uniform",
+        base_sample_steps=None,
+        split_pairs=(0, -1),
+        custom_sigmas=None,
+        dump_schedule_json=None,
+        method=None,
+        seed=None,
+        output_path=None,
+    ):
 
         # if no specific guidance scale is provided, use the default scale when initializing the scheduler
         if guidance_scale is None:
             guidance_scale = self.cfg_scale
-        
-        # text encoding        
+
+        # text encoding
         model_args = y
         if additional_args is not None:
             model_args.update(additional_args)
 
-        # gei sampling sigmas
-        sampling_sigmas = get_sampling_sigmas(sample_steps, sample_shift)
+        sampler_mode = str(sampler_mode).lower()
+        terminal_coord = 0.0
+        base_sigmas = None
+        bss_metadata = {}
+        inserted_midpoints = []
+
+        if sampler_mode == "uniform":
+            sampling_sigmas = get_sampling_sigmas(sample_steps, sample_shift)
+            actual_nfe = len(sampling_sigmas)
+            base_steps_for_payload = base_sample_steps
+        elif sampler_mode == "bss":
+            if base_sample_steps is None:
+                base_sample_steps = int(sample_steps) - 2
+            if int(base_sample_steps) <= 0:
+                raise ValueError("base_sample_steps must be positive for sampler_mode='bss'")
+            base_sigmas = get_sampling_sigmas(int(base_sample_steps), sample_shift)
+            sampling_sigmas, bss_metadata = make_boundary_split_coords(
+                base_sigmas,
+                split_indices=parse_split_pairs(split_pairs),
+                terminal_coord=terminal_coord,
+            )
+            actual_nfe = len(sampling_sigmas)
+            base_steps_for_payload = int(base_sample_steps)
+            inserted_midpoints = bss_metadata.get("inserted_midpoints", [])
+            if actual_nfe != int(sample_steps):
+                raise ValueError(
+                    f"BSS schedule length {actual_nfe} does not match sample_steps {sample_steps}; "
+                    "for BSS-T use base_sample_steps=T-2"
+                )
+        elif sampler_mode == "custom_sigmas":
+            if custom_sigmas is None:
+                raise ValueError("custom_sigmas must be provided for sampler_mode='custom_sigmas'")
+            sampling_sigmas = load_custom_sigmas(custom_sigmas)
+            actual_nfe = len(sampling_sigmas)
+            base_steps_for_payload = base_sample_steps
+        else:
+            raise ValueError(f"Unknown sampler_mode: {sampler_mode}")
 
         timesteps, _ = retrieve_timesteps(self.scheduler, device=device, sigmas=sampling_sigmas, shift=1)
+
+        if dump_schedule_json:
+            payload = build_schedule_payload(
+                method=method or sampler_mode,
+                sampler_mode=sampler_mode,
+                sample_steps=int(sample_steps),
+                sample_shift=float(sample_shift),
+                base_sample_steps=base_steps_for_payload,
+                actual_nfe=actual_nfe,
+                split_pairs=",".join(str(item) for item in parse_split_pairs(split_pairs)),
+                terminal_coord=terminal_coord,
+                base_sigmas=base_sigmas,
+                final_sigmas=sampling_sigmas,
+                timesteps=timesteps,
+                inserted_midpoints=inserted_midpoints,
+                seed=seed,
+                output_path=output_path,
+                metadata=bss_metadata,
+            )
+            write_schedule_json(dump_schedule_json, payload)
 
         assert mode in ("t2v", "i2v", "v2v"), f"Error: the {mode=} not in the choices ('i2v', 't2v', 'v2v')"
 
@@ -134,7 +209,7 @@ class RFLOW_WANX21_T2V:
             z = self.scheduler.step(noise_pred, t, z, return_dict=False, generator=generator)[0]
 
         return z
-    
+
     def get_timesteps(self, num_inference_steps, timesteps, strength, device):
         # get the original timestep using init_timestep
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)

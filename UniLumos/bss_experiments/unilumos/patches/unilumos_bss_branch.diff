@@ -1,0 +1,2864 @@
+diff --git a/UniLumos/UniLumos/src/schedulers/RFLOW_WANX21_T2V.py b/UniLumos/UniLumos/src/schedulers/RFLOW_WANX21_T2V.py
+index d5bcf76..ea45086 100644
+--- a/UniLumos/UniLumos/src/schedulers/RFLOW_WANX21_T2V.py
++++ b/UniLumos/UniLumos/src/schedulers/RFLOW_WANX21_T2V.py
+@@ -1,9 +1,21 @@
++import os
++import sys
+ import torch
+ import inspect
+ from tqdm import tqdm
+ import numpy as np
+ from .rectified_flow import FlowDPMSolverMultistepScheduler
+ 
++_TASK_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
++if _TASK_ROOT not in sys.path:
++    sys.path.insert(0, _TASK_ROOT)
++
++from bss_experiments.unilumos.bss_core.grids import make_boundary_split_coords, parse_split_pairs
++from bss_experiments.unilumos.bss_core.schedule_io import (
++    build_schedule_payload,
++    dump_schedule_json as write_schedule_json,
++    load_custom_sigmas,
++)
+ def get_sampling_sigmas(sampling_steps, shift):
+     sigma = np.linspace(1, 0, sampling_steps+1)[:sampling_steps]
+     sigma = (shift * sigma / (1 + (shift - 1) * sigma))
+@@ -43,7 +55,7 @@ def retrieve_timesteps(
+     else:
+         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+         timesteps = scheduler.timesteps
+-    
++
+     return timesteps, num_inference_steps
+ 
+ class RFLOW_WANX21_T2V:
+@@ -82,7 +94,7 @@ class RFLOW_WANX21_T2V:
+ 
+         arg_c = {'context': context, 'seq_len': max_seq_len, 'x_deg': deg_latent, 'x_bg': bg_latent}
+         arg_null = {'context': context_null, 'seq_len': max_seq_len, 'x_deg': deg_latent, 'x_bg': bg_latent}
+-        
++
+         return arg_c, arg_null
+ 
+     def sample(
+@@ -99,23 +111,86 @@ class RFLOW_WANX21_T2V:
+         progress=True,
+         mode="t2v",
+         sample_steps=25,
+-        sample_shift=8.0
+-    ):  
++        sample_shift=8.0,
++        sampler_mode="uniform",
++        base_sample_steps=None,
++        split_pairs=(0, -1),
++        custom_sigmas=None,
++        dump_schedule_json=None,
++        method=None,
++        seed=None,
++        output_path=None,
++    ):
+ 
+         # if no specific guidance scale is provided, use the default scale when initializing the scheduler
+         if guidance_scale is None:
+             guidance_scale = self.cfg_scale
+-        
+-        # text encoding        
++
++        # text encoding
+         model_args = y
+         if additional_args is not None:
+             model_args.update(additional_args)
+ 
+-        # gei sampling sigmas
+-        sampling_sigmas = get_sampling_sigmas(sample_steps, sample_shift)
++        sampler_mode = str(sampler_mode).lower()
++        terminal_coord = 0.0
++        base_sigmas = None
++        bss_metadata = {}
++        inserted_midpoints = []
++
++        if sampler_mode == "uniform":
++            sampling_sigmas = get_sampling_sigmas(sample_steps, sample_shift)
++            actual_nfe = len(sampling_sigmas)
++            base_steps_for_payload = base_sample_steps
++        elif sampler_mode == "bss":
++            if base_sample_steps is None:
++                base_sample_steps = int(sample_steps) - 2
++            if int(base_sample_steps) <= 0:
++                raise ValueError("base_sample_steps must be positive for sampler_mode='bss'")
++            base_sigmas = get_sampling_sigmas(int(base_sample_steps), sample_shift)
++            sampling_sigmas, bss_metadata = make_boundary_split_coords(
++                base_sigmas,
++                split_indices=parse_split_pairs(split_pairs),
++                terminal_coord=terminal_coord,
++            )
++            actual_nfe = len(sampling_sigmas)
++            base_steps_for_payload = int(base_sample_steps)
++            inserted_midpoints = bss_metadata.get("inserted_midpoints", [])
++            if actual_nfe != int(sample_steps):
++                raise ValueError(
++                    f"BSS schedule length {actual_nfe} does not match sample_steps {sample_steps}; "
++                    "for BSS-T use base_sample_steps=T-2"
++                )
++        elif sampler_mode == "custom_sigmas":
++            if custom_sigmas is None:
++                raise ValueError("custom_sigmas must be provided for sampler_mode='custom_sigmas'")
++            sampling_sigmas = load_custom_sigmas(custom_sigmas)
++            actual_nfe = len(sampling_sigmas)
++            base_steps_for_payload = base_sample_steps
++        else:
++            raise ValueError(f"Unknown sampler_mode: {sampler_mode}")
+ 
+         timesteps, _ = retrieve_timesteps(self.scheduler, device=device, sigmas=sampling_sigmas, shift=1)
+ 
++        if dump_schedule_json:
++            payload = build_schedule_payload(
++                method=method or sampler_mode,
++                sampler_mode=sampler_mode,
++                sample_steps=int(sample_steps),
++                sample_shift=float(sample_shift),
++                base_sample_steps=base_steps_for_payload,
++                actual_nfe=actual_nfe,
++                split_pairs=",".join(str(item) for item in parse_split_pairs(split_pairs)),
++                terminal_coord=terminal_coord,
++                base_sigmas=base_sigmas,
++                final_sigmas=sampling_sigmas,
++                timesteps=timesteps,
++                inserted_midpoints=inserted_midpoints,
++                seed=seed,
++                output_path=output_path,
++                metadata=bss_metadata,
++            )
++            write_schedule_json(dump_schedule_json, payload)
++
+         assert mode in ("t2v", "i2v", "v2v"), f"Error: the {mode=} not in the choices ('i2v', 't2v', 'v2v')"
+ 
+         if mode == "t2v":
+@@ -134,7 +209,7 @@ class RFLOW_WANX21_T2V:
+             z = self.scheduler.step(noise_pred, t, z, return_dict=False, generator=generator)[0]
+ 
+         return z
+-    
++
+     def get_timesteps(self, num_inference_steps, timesteps, strength, device):
+         # get the original timestep using init_timestep
+         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+@@ -142,4 +217,4 @@ class RFLOW_WANX21_T2V:
+         t_start = max(num_inference_steps - init_timestep, 0)
+         timesteps = timesteps[t_start * self.scheduler.order :]
+ 
+-        return timesteps, num_inference_steps - t_start
+\ No newline at end of file
++        return timesteps, num_inference_steps - t_start
+diff --git a/UniLumos/UniLumos/unilumos_infer_a.py b/UniLumos/UniLumos/unilumos_infer_a.py
+index 082f4ba..b811035 100644
+--- a/UniLumos/UniLumos/unilumos_infer_a.py
++++ b/UniLumos/UniLumos/unilumos_infer_a.py
+@@ -1,4 +1,10 @@
+ import os
++import sys
++
++_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
+ import argparse
+ from pprint import pformat
+ import torch
+@@ -17,7 +23,11 @@ from src.datasets.datasets import LumosDataset
+ from src.utils.utils_ import set_random_seed, save_sample
+ from src.utils.misc import create_logger
+ from src.encode_prompt import encode_prompt
+-
++from bss_experiments.unilumos.adapters.unilumos_adapter import (
++    add_bss_sampler_args,
++    case_matches,
++    make_schedule_json_path,
++)
+ def main(args):
+ 
+     torch.set_grad_enabled(False)
+@@ -33,7 +43,7 @@ def main(args):
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+     torch.cuda.set_device(device)  # 如果是 cuda 设备
+ 
+-    set_random_seed(seed=0)
++    set_random_seed(seed=args.seed)
+ 
+     # == init logger ==
+     logger = create_logger(None)
+@@ -45,7 +55,7 @@ def main(args):
+     # build model & load weights
+     # ======================================================
+ 
+-    logger.info("Building models...") 
++    logger.info("Building models...")
+     logger.info("step 1: build text-encoder")
+     text_encoder = WanX21T5Encoder(
+             name='umt5_xxl',
+@@ -59,9 +69,9 @@ def main(args):
+     vae = WanX21_VAE(
+         vae_pth=args.vae_path
+     )
+-    vae.model = vae.model.to(device=device, dtype=dtype).eval()         
++    vae.model = vae.model.to(device=device, dtype=dtype).eval()
+ 
+-    logger.info("step 3: build wanx core model")    
++    logger.info("step 3: build wanx core model")
+     model = Transformer().to(device=device, dtype=dtype).eval()
+ 
+     # load model
+@@ -106,20 +116,21 @@ def main(args):
+     # ======================================================
+     # inference
+     # ======================================================
+-    
++
+     # == prepare arguments ==
+     save_dir = args.save_dir
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     model.eval()
++    processed_cases = 0
+     with torch.no_grad():
+-        for data_i in tqdm(dataloader, desc="Inference Progress", disable=not verbose):    
++        for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
+ 
+             # Extract data from dataloader
+             video_ref = data_i['video'].to(device, dtype)  # Reference video
+             video_background = data_i["video_bg"].to(device, dtype) # video_background, [B, C, T, H, W]
+             video_degradation = data_i['video_deg'].to(device, dtype)  # Degradation video
+-            
++
+             # only use captions
+             video_background = torch.zeros_like(video_background).to(device, dtype)
+             video_degradation = torch.zeros_like(video_degradation).to(device, dtype)
+@@ -130,11 +141,14 @@ def main(args):
+             ori_path = data_i["ori_path"][0]
+             bg_path_name = os.path.splitext(os.path.basename(bg_path))[0]
+             base_name = os.path.splitext(os.path.basename(ori_path))[0]
+-
++            if not case_matches(args, idx, base_name, bg_path_name):
++                continue
++            output_stem = os.path.join(save_dir, f"{base_name}_{bg_path_name}_gen")
++            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
+             # Generate random noise
+-            generator = torch.Generator(device=device).manual_seed(0)
++            generator = torch.Generator(device=device).manual_seed(args.seed)
+             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
+-            
++
+             # Encode prompt, background, and degradation
+             y = encode_prompt(
+                 prompt=batch_prompts,
+@@ -161,8 +175,16 @@ def main(args):
+                 mask=None,
+                 generator=generator,
+                 mode="t2v",
+-                sample_steps = 25, # sample_steps
+-                sample_shift = 8.0, # sample_shift
++                sample_steps=args.sample_steps,
++                sample_shift=args.sample_shift,
++                sampler_mode=args.sampler_mode,
++                base_sample_steps=args.base_sample_steps,
++                split_pairs=args.split_pairs,
++                custom_sigmas=args.custom_sigmas,
++                dump_schedule_json=schedule_json_path,
++                method=args.method,
++                seed=args.seed,
++                output_path=output_stem,
+             )
+ 
+             samples = vae.decode(samples)
+@@ -179,10 +201,13 @@ def main(args):
+             save_sample(
+                 video,
+                 fps=args.fps,
+-                save_path=f"{save_dir}/{base_name}_{bg_path_name}_gen",
++                save_path=output_stem,
+                 verbose=verbose,
+             )
+-            
++            processed_cases += 1
++            if args.max_cases is not None and processed_cases >= args.max_cases:
++                break
++
+             # # save original video
+             # save_sample(
+             #     v_ori,
+@@ -213,11 +238,13 @@ if __name__ == "__main__":
+     parser.add_argument("--image_size",  type=str,  default=(480, 832), help="image size")
+     parser.add_argument("--num_frames",  type=int,  default=49, help="number of frames")
+     parser.add_argument("--fps",  type=int,  default=12, help="fps")
+-    
++
+     parser.add_argument("--data_path",  type=str,  default="./examples/examples_refined.csv", help="path to data")
+ 
+     parser.add_argument("--save_dir",  type=str,  default="./examples/results", help="path to save results")
+ 
++    add_bss_sampler_args(parser)
++
+     args = parser.parse_args()
+ 
+-    main(args)
+\ No newline at end of file
++    main(args)
+diff --git a/UniLumos/UniLumos/unilumos_infer_ab.py b/UniLumos/UniLumos/unilumos_infer_ab.py
+index 615b87e..05bd31e 100644
+--- a/UniLumos/UniLumos/unilumos_infer_ab.py
++++ b/UniLumos/UniLumos/unilumos_infer_ab.py
+@@ -1,4 +1,10 @@
+ import os
++import sys
++
++_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
+ import argparse
+ from pprint import pformat
+ import torch
+@@ -17,7 +23,11 @@ from src.datasets.datasets import LumosDataset
+ from src.utils.utils_ import set_random_seed, save_sample
+ from src.utils.misc import create_logger
+ from src.encode_prompt import encode_prompt
+-
++from bss_experiments.unilumos.adapters.unilumos_adapter import (
++    add_bss_sampler_args,
++    case_matches,
++    make_schedule_json_path,
++)
+ def main(args):
+ 
+     torch.set_grad_enabled(False)
+@@ -33,7 +43,7 @@ def main(args):
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+     torch.cuda.set_device(device)  # 如果是 cuda 设备
+ 
+-    set_random_seed(seed=0)
++    set_random_seed(seed=args.seed)
+ 
+     # == init logger ==
+     logger = create_logger(None)
+@@ -45,7 +55,7 @@ def main(args):
+     # build model & load weights
+     # ======================================================
+ 
+-    logger.info("Building models...") 
++    logger.info("Building models...")
+     logger.info("step 1: build text-encoder")
+     text_encoder = WanX21T5Encoder(
+             name='umt5_xxl',
+@@ -59,9 +69,9 @@ def main(args):
+     vae = WanX21_VAE(
+         vae_pth=args.vae_path
+     )
+-    vae.model = vae.model.to(device=device, dtype=dtype).eval()         
++    vae.model = vae.model.to(device=device, dtype=dtype).eval()
+ 
+-    logger.info("step 3: build wanx core model")    
++    logger.info("step 3: build wanx core model")
+     model = Transformer().to(device=device, dtype=dtype).eval()
+ 
+     # load model
+@@ -106,14 +116,15 @@ def main(args):
+     # ======================================================
+     # inference
+     # ======================================================
+-    
++
+     # == prepare arguments ==
+     save_dir = args.save_dir
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     model.eval()
++    processed_cases = 0
+     with torch.no_grad():
+-        for data_i in tqdm(dataloader, desc="Inference Progress", disable=not verbose):    
++        for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
+ 
+             # Extract data from dataloader
+             video_ref = data_i['video'].to(device, dtype)  # Reference video
+@@ -128,11 +139,14 @@ def main(args):
+             ori_path = data_i["ori_path"][0]
+             bg_path_name = os.path.splitext(os.path.basename(bg_path))[0]
+             base_name = os.path.splitext(os.path.basename(ori_path))[0]
+-
++            if not case_matches(args, idx, base_name, bg_path_name):
++                continue
++            output_stem = os.path.join(save_dir, f"{base_name}_{bg_path_name}_gen")
++            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
+             # Generate random noise
+-            generator = torch.Generator(device=device).manual_seed(0)
++            generator = torch.Generator(device=device).manual_seed(args.seed)
+             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
+-            
++
+             # Encode prompt, background, and degradation
+             y = encode_prompt(
+                 prompt=batch_prompts,
+@@ -159,8 +173,16 @@ def main(args):
+                 mask=None,
+                 generator=generator,
+                 mode="t2v",
+-                sample_steps = 25, # sample_steps
+-                sample_shift = 8.0, # sample_shift
++                sample_steps=args.sample_steps,
++                sample_shift=args.sample_shift,
++                sampler_mode=args.sampler_mode,
++                base_sample_steps=args.base_sample_steps,
++                split_pairs=args.split_pairs,
++                custom_sigmas=args.custom_sigmas,
++                dump_schedule_json=schedule_json_path,
++                method=args.method,
++                seed=args.seed,
++                output_path=output_stem,
+             )
+ 
+             samples = vae.decode(samples)
+@@ -177,10 +199,13 @@ def main(args):
+             save_sample(
+                 video,
+                 fps=args.fps,
+-                save_path=f"{save_dir}/{base_name}_{bg_path_name}_gen",
++                save_path=output_stem,
+                 verbose=verbose,
+             )
+-            
++            processed_cases += 1
++            if args.max_cases is not None and processed_cases >= args.max_cases:
++                break
++
+             # # save original video
+             # save_sample(
+             #     v_ori,
+@@ -211,11 +236,13 @@ if __name__ == "__main__":
+     parser.add_argument("--image_size",  type=str,  default=(480, 832), help="image size")
+     parser.add_argument("--num_frames",  type=int,  default=49, help="number of frames")
+     parser.add_argument("--fps",  type=int,  default=12, help="fps")
+-    
++
+     parser.add_argument("--data_path",  type=str,  default="./examples/examples_refined.csv", help="path to data")
+ 
+     parser.add_argument("--save_dir",  type=str,  default="./examples/results", help="path to save results")
+ 
++    add_bss_sampler_args(parser)
++
+     args = parser.parse_args()
+ 
+-    main(args)
+\ No newline at end of file
++    main(args)
+diff --git a/UniLumos/UniLumos/unilumos_infer_abc.py b/UniLumos/UniLumos/unilumos_infer_abc.py
+index 3728522..d05f59a 100644
+--- a/UniLumos/UniLumos/unilumos_infer_abc.py
++++ b/UniLumos/UniLumos/unilumos_infer_abc.py
+@@ -1,4 +1,10 @@
+ import os
++import sys
++
++_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
+ import argparse
+ from pprint import pformat
+ import torch
+@@ -17,7 +23,11 @@ from src.datasets.datasets import LumosDataset
+ from src.utils.utils_ import set_random_seed, save_sample
+ from src.utils.misc import create_logger
+ from src.encode_prompt import encode_prompt
+-
++from bss_experiments.unilumos.adapters.unilumos_adapter import (
++    add_bss_sampler_args,
++    case_matches,
++    make_schedule_json_path,
++)
+ def main(args):
+ 
+     torch.set_grad_enabled(False)
+@@ -33,7 +43,7 @@ def main(args):
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+     torch.cuda.set_device(device)  # 如果是 cuda 设备
+ 
+-    set_random_seed(seed=0)
++    set_random_seed(seed=args.seed)
+ 
+     # == init logger ==
+     logger = create_logger(None)
+@@ -45,7 +55,7 @@ def main(args):
+     # build model & load weights
+     # ======================================================
+ 
+-    logger.info("Building models...") 
++    logger.info("Building models...")
+     logger.info("step 1: build text-encoder")
+     text_encoder = WanX21T5Encoder(
+             name='umt5_xxl',
+@@ -59,9 +69,9 @@ def main(args):
+     vae = WanX21_VAE(
+         vae_pth=args.vae_path
+     )
+-    vae.model = vae.model.to(device=device, dtype=dtype).eval()         
++    vae.model = vae.model.to(device=device, dtype=dtype).eval()
+ 
+-    logger.info("step 3: build wanx core model")    
++    logger.info("step 3: build wanx core model")
+     model = Transformer().to(device=device, dtype=dtype).eval()
+ 
+     # load model
+@@ -106,14 +116,15 @@ def main(args):
+     # ======================================================
+     # inference
+     # ======================================================
+-    
++
+     # == prepare arguments ==
+     save_dir = args.save_dir
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     model.eval()
++    processed_cases = 0
+     with torch.no_grad():
+-        for data_i in tqdm(dataloader, desc="Inference Progress", disable=not verbose):    
++        for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
+ 
+             # Extract data from dataloader
+             video_ref = data_i['video'].to(device, dtype)  # Reference video
+@@ -124,11 +135,14 @@ def main(args):
+             ori_path = data_i["ori_path"][0]
+             bg_path_name = os.path.splitext(os.path.basename(bg_path))[0]
+             base_name = os.path.splitext(os.path.basename(ori_path))[0]
+-
++            if not case_matches(args, idx, base_name, bg_path_name):
++                continue
++            output_stem = os.path.join(save_dir, f"{base_name}_{bg_path_name}_gen")
++            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
+             # Generate random noise
+-            generator = torch.Generator(device=device).manual_seed(0)
++            generator = torch.Generator(device=device).manual_seed(args.seed)
+             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
+-            
++
+             # Encode prompt, background, and degradation
+             y = encode_prompt(
+                 prompt=batch_prompts,
+@@ -155,8 +169,16 @@ def main(args):
+                 mask=None,
+                 generator=generator,
+                 mode="t2v",
+-                sample_steps = 25, # sample_steps
+-                sample_shift = 8.0, # sample_shift
++                sample_steps=args.sample_steps,
++                sample_shift=args.sample_shift,
++                sampler_mode=args.sampler_mode,
++                base_sample_steps=args.base_sample_steps,
++                split_pairs=args.split_pairs,
++                custom_sigmas=args.custom_sigmas,
++                dump_schedule_json=schedule_json_path,
++                method=args.method,
++                seed=args.seed,
++                output_path=output_stem,
+             )
+ 
+             samples = vae.decode(samples)
+@@ -173,10 +195,13 @@ def main(args):
+             save_sample(
+                 video,
+                 fps=args.fps,
+-                save_path=f"{save_dir}/{base_name}_{bg_path_name}_gen",
++                save_path=output_stem,
+                 verbose=verbose,
+             )
+-            
++            processed_cases += 1
++            if args.max_cases is not None and processed_cases >= args.max_cases:
++                break
++
+             # # save original video
+             # save_sample(
+             #     v_ori,
+@@ -207,11 +232,13 @@ if __name__ == "__main__":
+     parser.add_argument("--image_size",  type=str,  default=(480, 832), help="image size")
+     parser.add_argument("--num_frames",  type=int,  default=49, help="number of frames")
+     parser.add_argument("--fps",  type=int,  default=12, help="fps")
+-    
++
+     parser.add_argument("--data_path",  type=str,  default="./examples/examples_refined.csv", help="path to data")
+ 
+     parser.add_argument("--save_dir",  type=str,  default="./examples/results", help="path to save results")
+ 
++    add_bss_sampler_args(parser)
++
+     args = parser.parse_args()
+ 
+-    main(args)
+\ No newline at end of file
++    main(args)
+diff --git a/UniLumos/UniLumos/unilumos_infer_ac.py b/UniLumos/UniLumos/unilumos_infer_ac.py
+index 9aa67b7..c0dd1d1 100644
+--- a/UniLumos/UniLumos/unilumos_infer_ac.py
++++ b/UniLumos/UniLumos/unilumos_infer_ac.py
+@@ -1,4 +1,10 @@
+ import os
++import sys
++
++_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
+ import argparse
+ from pprint import pformat
+ import torch
+@@ -17,7 +23,11 @@ from src.datasets.datasets import LumosDataset
+ from src.utils.utils_ import set_random_seed, save_sample
+ from src.utils.misc import create_logger
+ from src.encode_prompt import encode_prompt
+-
++from bss_experiments.unilumos.adapters.unilumos_adapter import (
++    add_bss_sampler_args,
++    case_matches,
++    make_schedule_json_path,
++)
+ def main(args):
+ 
+     torch.set_grad_enabled(False)
+@@ -33,7 +43,7 @@ def main(args):
+     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+     torch.cuda.set_device(device)  # 如果是 cuda 设备
+ 
+-    set_random_seed(seed=0)
++    set_random_seed(seed=args.seed)
+ 
+     # == init logger ==
+     logger = create_logger(None)
+@@ -45,7 +55,7 @@ def main(args):
+     # build model & load weights
+     # ======================================================
+ 
+-    logger.info("Building models...") 
++    logger.info("Building models...")
+     logger.info("step 1: build text-encoder")
+     text_encoder = WanX21T5Encoder(
+             name='umt5_xxl',
+@@ -59,9 +69,9 @@ def main(args):
+     vae = WanX21_VAE(
+         vae_pth=args.vae_path
+     )
+-    vae.model = vae.model.to(device=device, dtype=dtype).eval()         
++    vae.model = vae.model.to(device=device, dtype=dtype).eval()
+ 
+-    logger.info("step 3: build wanx core model")    
++    logger.info("step 3: build wanx core model")
+     model = Transformer().to(device=device, dtype=dtype).eval()
+ 
+     # load model
+@@ -106,14 +116,15 @@ def main(args):
+     # ======================================================
+     # inference
+     # ======================================================
+-    
++
+     # == prepare arguments ==
+     save_dir = args.save_dir
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     model.eval()
++    processed_cases = 0
+     with torch.no_grad():
+-        for data_i in tqdm(dataloader, desc="Inference Progress", disable=not verbose):    
++        for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
+ 
+             # Extract data from dataloader
+             video_ref = data_i['video'].to(device, dtype)  # Reference video
+@@ -128,11 +139,14 @@ def main(args):
+             ori_path = data_i["ori_path"][0]
+             bg_path_name = os.path.splitext(os.path.basename(bg_path))[0]
+             base_name = os.path.splitext(os.path.basename(ori_path))[0]
+-
++            if not case_matches(args, idx, base_name, bg_path_name):
++                continue
++            output_stem = os.path.join(save_dir, f"{base_name}_{bg_path_name}_gen")
++            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
+             # Generate random noise
+-            generator = torch.Generator(device=device).manual_seed(0)
++            generator = torch.Generator(device=device).manual_seed(args.seed)
+             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
+-            
++
+             # Encode prompt, background, and degradation
+             y = encode_prompt(
+                 prompt=batch_prompts,
+@@ -159,8 +173,16 @@ def main(args):
+                 mask=None,
+                 generator=generator,
+                 mode="t2v",
+-                sample_steps = 25, # sample_steps
+-                sample_shift = 8.0, # sample_shift
++                sample_steps=args.sample_steps,
++                sample_shift=args.sample_shift,
++                sampler_mode=args.sampler_mode,
++                base_sample_steps=args.base_sample_steps,
++                split_pairs=args.split_pairs,
++                custom_sigmas=args.custom_sigmas,
++                dump_schedule_json=schedule_json_path,
++                method=args.method,
++                seed=args.seed,
++                output_path=output_stem,
+             )
+ 
+             samples = vae.decode(samples)
+@@ -177,10 +199,13 @@ def main(args):
+             save_sample(
+                 video,
+                 fps=args.fps,
+-                save_path=f"{save_dir}/{base_name}_{bg_path_name}_gen",
++                save_path=output_stem,
+                 verbose=verbose,
+             )
+-            
++            processed_cases += 1
++            if args.max_cases is not None and processed_cases >= args.max_cases:
++                break
++
+             # # save original video
+             # save_sample(
+             #     v_ori,
+@@ -211,11 +236,13 @@ if __name__ == "__main__":
+     parser.add_argument("--image_size",  type=str,  default=(480, 832), help="image size")
+     parser.add_argument("--num_frames",  type=int,  default=49, help="number of frames")
+     parser.add_argument("--fps",  type=int,  default=12, help="fps")
+-    
++
+     parser.add_argument("--data_path",  type=str,  default="./examples/examples_refined.csv", help="path to data")
+ 
+     parser.add_argument("--save_dir",  type=str,  default="./examples/results", help="path to save results")
+ 
++    add_bss_sampler_args(parser)
++
+     args = parser.parse_args()
+ 
+-    main(args)
+\ No newline at end of file
++    main(args)
+diff --git a/UniLumos/UniLumos/unilumos_infer_image.py b/UniLumos/UniLumos/unilumos_infer_image.py
+index a697ef6..1ec1ba2 100644
+--- a/UniLumos/UniLumos/unilumos_infer_image.py
++++ b/UniLumos/UniLumos/unilumos_infer_image.py
+@@ -1,4 +1,10 @@
+ import os
++import sys
++
++_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
++if _PROJECT_ROOT not in sys.path:
++    sys.path.insert(0, _PROJECT_ROOT)
++
+ import argparse
+ from pprint import pformat
+ import torch
+@@ -17,7 +23,11 @@ from src.datasets.datasets import VideoTextDataset
+ from src.utils.utils_ import set_random_seed, save_sample
+ from src.utils.misc import create_logger
+ from src.encode_prompt import encode_prompt
+-
++from bss_experiments.unilumos.adapters.unilumos_adapter import (
++    add_bss_sampler_args,
++    case_matches,
++    make_schedule_json_path,
++)
+ 
+ def main(args):
+ 
+@@ -34,7 +44,7 @@ def main(args):
+     if device.type == "cuda":
+         torch.cuda.set_device(device)
+ 
+-    set_random_seed(seed=0)
++    set_random_seed(seed=args.seed)
+ 
+     # == init logger ==
+     logger = create_logger(None)
+@@ -115,6 +125,7 @@ def main(args):
+     os.makedirs(save_dir, exist_ok=True)
+ 
+     model.eval()
++    processed_cases = 0
+     with torch.no_grad():
+         for idx, data_i in enumerate(tqdm(dataloader, desc="Inference Progress", disable=not verbose)):
+ 
+@@ -135,9 +146,12 @@ def main(args):
+             else:
+                 ori_path = f"sample_{idx}"
+             base_name = os.path.splitext(os.path.basename(ori_path))[0]
+-
++            if not case_matches(args, idx, base_name):
++                continue
++            output_stem = os.path.join(save_dir, f"{base_name}_gen")
++            schedule_json_path = make_schedule_json_path(args.dump_schedule_json, output_stem, idx)
+             # Generate random noise
+-            generator = torch.Generator(device=device).manual_seed(0)
++            generator = torch.Generator(device=device).manual_seed(args.seed)
+             z = torch.randn(len(batch_prompts), vae.model.z_dim, *latent_size, device=device, generator=generator, dtype=dtype)
+ 
+             # Encode prompt, background, and degradation
+@@ -166,8 +180,16 @@ def main(args):
+                 mask=None,
+                 generator=generator,
+                 mode="t2v",
+-                sample_steps=25,  # sample_steps
+-                sample_shift=8.0,  # sample_shift
++                sample_steps=args.sample_steps,
++                sample_shift=args.sample_shift,
++                sampler_mode=args.sampler_mode,
++                base_sample_steps=args.base_sample_steps,
++                split_pairs=args.split_pairs,
++                custom_sigmas=args.custom_sigmas,
++                dump_schedule_json=schedule_json_path,
++                method=args.method,
++                seed=args.seed,
++                output_path=output_stem,
+             )
+ 
+             samples = vae.decode(samples)
+@@ -184,9 +206,12 @@ def main(args):
+             save_sample(
+                 video,
+                 fps=args.fps,
+-                save_path=f"{save_dir}/{base_name}_gen",
++                save_path=output_stem,
+                 verbose=verbose,
+             )
++            processed_cases += 1
++            if args.max_cases is not None and processed_cases >= args.max_cases:
++                break
+ 
+             # # save original
+             # save_sample(
+@@ -223,6 +248,8 @@ if __name__ == "__main__":
+ 
+     parser.add_argument("--save_dir", type=str, default="./examples/results_image", help="path to save results")
+ 
++    add_bss_sampler_args(parser)
++
+     args = parser.parse_args()
+ 
+     main(args)
+diff --git a/UniLumos/bss_experiments/unilumos/README.md b/UniLumos/bss_experiments/unilumos/README.md
+new file mode 100644
+index 0000000..43dc03b
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/README.md
+@@ -0,0 +1,28 @@
++# UniLumos BSS Official-Protocol Smoke
++
++This folder contains the local code-only scaffold for a UniLumos Boundary-Split
++Sampling (BSS) smoke experiment.
++
++The intended execution target is Google Colab with model weights stored on
++Google Drive. Local work in this branch is limited to code, manifests,
++schedule validation, metrics utilities, reports, and the Colab notebook.
++
++Strict scope:
++
++- Do not train.
++- Do not modify model weights.
++- Do not modify UniLumos conditioning, prompt processing, checkpoint loading,
++  resolution, VAE, dataset preprocessing, or architecture.
++- Preserve the official uniform schedule path.
++- Add only inference-time schedule controls and experiment utilities.
++
++Primary smoke:
++
++- `uniform8`
++- `uniform10`
++- `bss10 = base8 + split first/last`
++- `reference = uniform25`
++
++The high-step/default reference is an evaluation reference, not ground truth.
++The first result should be described as cross-model smoke evidence, not a
++generality claim.
+diff --git a/UniLumos/bss_experiments/unilumos/adapters/__init__.py b/UniLumos/bss_experiments/unilumos/adapters/__init__.py
+new file mode 100644
+index 0000000..706b65e
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/adapters/__init__.py
+@@ -0,0 +1 @@
++"""Adapters for UniLumos BSS experiments."""
+diff --git a/UniLumos/bss_experiments/unilumos/adapters/unilumos_adapter.py b/UniLumos/bss_experiments/unilumos/adapters/unilumos_adapter.py
+new file mode 100644
+index 0000000..c8ffc1a
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/adapters/unilumos_adapter.py
+@@ -0,0 +1,44 @@
++"""Small adapter helpers used by patched UniLumos inference scripts."""
++
++from __future__ import annotations
++
++import os
++
++
++def add_bss_sampler_args(parser) -> None:
++    parser.add_argument("--sample_steps", type=int, default=25, help="actual model evaluations")
++    parser.add_argument("--sample_shift", type=float, default=8.0, help="UniLumos shifted sigma parameter")
++    parser.add_argument("--seed", type=int, default=0, help="random seed for noise and global RNG")
++    parser.add_argument(
++        "--sampler_mode",
++        type=str,
++        default="uniform",
++        choices=("uniform", "bss", "custom_sigmas"),
++        help="schedule construction mode",
++    )
++    parser.add_argument("--base_sample_steps", type=int, default=None, help="base NFE for BSS")
++    parser.add_argument("--split_pairs", type=str, default="0,-1", help="BSS split indices")
++    parser.add_argument("--custom_sigmas", type=str, default=None, help="JSON or NPY custom sigma schedule")
++    parser.add_argument("--dump_schedule_json", type=str, default=None, help="path or 'auto' for schedule JSON")
++    parser.add_argument("--method", type=str, default=None, help="experiment method label")
++    parser.add_argument("--max_cases", type=int, default=None, help="maximum cases to run")
++    parser.add_argument("--case_filter", type=str, default=None, help="substring filter over case identifiers")
++
++
++def case_matches(args, *parts) -> bool:
++    if not getattr(args, "case_filter", None):
++        return True
++    haystack = " ".join(str(part) for part in parts if part is not None)
++    return args.case_filter in haystack
++
++
++def make_schedule_json_path(dump_schedule_json, output_stem: str, case_index: int | None = None) -> str | None:
++    if not dump_schedule_json:
++        return None
++    if str(dump_schedule_json).lower() == "auto":
++        return f"{output_stem}_schedule.json"
++    root, ext = os.path.splitext(str(dump_schedule_json))
++    if ext.lower() == ".json":
++        return str(dump_schedule_json)
++    suffix = "" if case_index is None else f"_{case_index:04d}"
++    return os.path.join(str(dump_schedule_json), f"schedule{suffix}.json")
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/__init__.py b/UniLumos/bss_experiments/unilumos/bss_core/__init__.py
+new file mode 100644
+index 0000000..532746a
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/__init__.py
+@@ -0,0 +1,9 @@
++"""Model-agnostic BSS helpers for UniLumos experiments."""
++
++from .grids import get_uniform_shifted_sigmas, make_boundary_split_coords, parse_split_pairs
++
++__all__ = [
++    "get_uniform_shifted_sigmas",
++    "make_boundary_split_coords",
++    "parse_split_pairs",
++]
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/grids.py b/UniLumos/bss_experiments/unilumos/bss_core/grids.py
+new file mode 100644
+index 0000000..df372d5
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/grids.py
+@@ -0,0 +1,120 @@
++"""Schedule grid construction for Boundary-Split Sampling."""
++
++from __future__ import annotations
++
++from collections import defaultdict
++from typing import Iterable, Sequence
++
++
++def _as_float_list(values: Iterable[float], name: str) -> list[float]:
++    try:
++        result = [float(v) for v in values]
++    except TypeError as exc:
++        raise TypeError(f"{name} must be an iterable of numbers") from exc
++    if not result:
++        raise ValueError(f"{name} must not be empty")
++    return result
++
++
++def parse_split_pairs(value: str | Sequence[int] | None) -> tuple[int, ...]:
++    """Parse split-pair CLI values such as ``"0,-1"``."""
++
++    if value is None:
++        return (0, -1)
++    if isinstance(value, str):
++        pieces = [piece.strip() for piece in value.split(",") if piece.strip()]
++        if not pieces:
++            return (0, -1)
++        return tuple(int(piece) for piece in pieces)
++    return tuple(int(piece) for piece in value)
++
++
++def get_uniform_shifted_sigmas(sample_steps: int, sample_shift: float) -> list[float]:
++    """
++    Match UniLumos official get_sampling_sigmas:
++
++    sigma = np.linspace(1, 0, sample_steps + 1)[:sample_steps]
++    sigma = shift * sigma / (1 + (shift - 1) * sigma)
++    """
++
++    if sample_steps <= 0:
++        raise ValueError("sample_steps must be positive")
++    shift = float(sample_shift)
++    sigmas = []
++    for i in range(sample_steps):
++        sigma = 1.0 - (float(i) / float(sample_steps))
++        shifted = shift * sigma / (1.0 + (shift - 1.0) * sigma)
++        sigmas.append(float(shifted))
++    return sigmas
++
++
++def make_boundary_split_coords(
++    base_coords: Iterable[float],
++    split_indices: str | Sequence[int] = (0, -1),
++    terminal_coord: float = 0.0,
++    midpoint_mode: str = "linear",
++) -> tuple[list[float], dict]:
++    """
++    Construct BSS coordinates from official base solver coordinates.
++
++    For base NFE K and the default split indices, the output is:
++    base[0], midpoint(base[0], base[1]), base[1], ..., base[-1],
++    midpoint(base[-1], terminal).
++    """
++
++    if midpoint_mode != "linear":
++        raise ValueError(f"Unsupported midpoint_mode: {midpoint_mode}")
++
++    base = _as_float_list(base_coords, "base_coords")
++    split_indices = parse_split_pairs(split_indices)
++    terminal = float(terminal_coord)
++
++    insert_after: dict[int, list[dict]] = defaultdict(list)
++    inserted_midpoints: list[dict] = []
++
++    for raw_index in split_indices:
++        if raw_index == -1:
++            left_index = len(base) - 1
++            left = base[left_index]
++            right = terminal
++            right_index = "terminal"
++        else:
++            left_index = int(raw_index)
++            if left_index < 0 or left_index >= len(base) - 1:
++                raise ValueError(
++                    f"split index {raw_index} must refer to an internal interval "
++                    "or use -1 for the terminal interval"
++                )
++            left = base[left_index]
++            right = base[left_index + 1]
++            right_index = left_index + 1
++
++        midpoint = (left + right) / 2.0
++        record = {
++            "split_index": raw_index,
++            "left_index": left_index,
++            "right_index": right_index,
++            "left": left,
++            "right": right,
++            "midpoint": midpoint,
++        }
++        insert_after[left_index].append(record)
++        inserted_midpoints.append(record)
++
++    final_coords: list[float] = []
++    for index, coord in enumerate(base):
++        final_coords.append(coord)
++        for record in insert_after.get(index, []):
++            final_coords.append(record["midpoint"])
++
++    metadata = {
++        "base_nfe": len(base),
++        "actual_nfe": len(final_coords),
++        "split_indices": list(split_indices),
++        "terminal_coord": terminal,
++        "midpoint_mode": midpoint_mode,
++        "inserted_midpoints": inserted_midpoints,
++        "preserves_base_first": final_coords[0] == base[0],
++        "preserves_base_last": base[-1] in final_coords,
++    }
++    return final_coords, metadata
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/manifest.py b/UniLumos/bss_experiments/unilumos/bss_core/manifest.py
+new file mode 100644
+index 0000000..769d434
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/manifest.py
+@@ -0,0 +1,59 @@
++"""Manifest helpers for UniLumos smoke runs."""
++
++from __future__ import annotations
++
++import csv
++from pathlib import Path
++
++
++MANIFEST_FIELDS = [
++    "run_id",
++    "model_name",
++    "protocol",
++    "mode",
++    "case_id",
++    "foreground_id",
++    "background_id",
++    "prompt_hash",
++    "method",
++    "method_family",
++    "sampler_mode",
++    "sample_steps",
++    "base_sample_steps",
++    "actual_nfe",
++    "sample_shift",
++    "split_pairs",
++    "seed",
++    "input_paths",
++    "checkpoint_paths",
++    "case_data_path",
++    "output_path",
++    "schedule_json_path",
++    "stdout_log_path",
++    "stderr_log_path",
++    "runtime_json_path",
++    "status",
++    "error_message",
++    "git_commit",
++    "code_dirty_flag",
++]
++
++
++def read_manifest(path: str | Path) -> list[dict]:
++    with Path(path).open("r", encoding="utf-8", newline="") as handle:
++        return list(csv.DictReader(handle))
++
++
++def write_manifest(path: str | Path, rows: list[dict]) -> None:
++    target = Path(path)
++    target.parent.mkdir(parents=True, exist_ok=True)
++    fields = list(MANIFEST_FIELDS)
++    for row in rows:
++        for key in row:
++            if key not in fields:
++                fields.append(key)
++    with target.open("w", encoding="utf-8", newline="") as handle:
++        writer = csv.DictWriter(handle, fieldnames=fields)
++        writer.writeheader()
++        for row in rows:
++            writer.writerow(row)
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/metrics.py b/UniLumos/bss_experiments/unilumos/bss_core/metrics.py
+new file mode 100644
+index 0000000..652f52d
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/metrics.py
+@@ -0,0 +1,76 @@
++"""Lightweight reference metrics for UniLumos outputs."""
++
++from __future__ import annotations
++
++import math
++from pathlib import Path
++
++import numpy as np
++
++
++def _read_media(path: str | Path, max_frames: int | None = None) -> np.ndarray:
++    source = Path(path)
++    try:
++        import imageio.v3 as iio
++
++        if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
++            arr = iio.imread(source)
++            return arr[None, ...].astype(np.float32) / 255.0
++
++        frames = []
++        for index, frame in enumerate(iio.imiter(source)):
++            if max_frames is not None and index >= max_frames:
++                break
++            frames.append(np.asarray(frame, dtype=np.float32) / 255.0)
++        if not frames:
++            raise ValueError(f"No frames read from {source}")
++        return np.stack(frames, axis=0)
++    except ImportError as exc:
++        raise RuntimeError("imageio is required for media metrics") from exc
++
++
++def align_frame_count(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
++    count = min(len(a), len(b))
++    return a[:count], b[:count]
++
++
++def rgb_l1(a: np.ndarray, b: np.ndarray) -> float:
++    a, b = align_frame_count(a, b)
++    return float(np.mean(np.abs(a - b)))
++
++
++def rgb_l2(a: np.ndarray, b: np.ndarray) -> float:
++    a, b = align_frame_count(a, b)
++    return float(np.mean((a - b) ** 2))
++
++
++def psnr(a: np.ndarray, b: np.ndarray) -> float:
++    mse = rgb_l2(a, b)
++    if mse <= 0.0:
++        return float("inf")
++    return float(20.0 * math.log10(1.0 / math.sqrt(mse)))
++
++
++def temporal_diff_l1(video: np.ndarray) -> float:
++    if len(video) < 2:
++        return 0.0
++    return float(np.mean(np.abs(video[1:] - video[:-1])))
++
++
++def temporal_diff_l1_to_ref(video: np.ndarray, ref: np.ndarray) -> float:
++    video, ref = align_frame_count(video, ref)
++    if len(video) < 2:
++        return 0.0
++    return rgb_l1(video[1:] - video[:-1], ref[1:] - ref[:-1])
++
++
++def compute_against_reference(output_path: str | Path, reference_path: str | Path, max_frames: int | None = None) -> dict:
++    output = _read_media(output_path, max_frames=max_frames)
++    reference = _read_media(reference_path, max_frames=max_frames)
++    return {
++        "rgb_l1": rgb_l1(output, reference),
++        "rgb_l2": rgb_l2(output, reference),
++        "psnr": psnr(output, reference),
++        "temporal_diff_l1": temporal_diff_l1(output),
++        "temporal_diff_l1_to_ref": temporal_diff_l1_to_ref(output, reference),
++    }
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/schedule_io.py b/UniLumos/bss_experiments/unilumos/bss_core/schedule_io.py
+new file mode 100644
+index 0000000..26f2c43
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/schedule_io.py
+@@ -0,0 +1,131 @@
++"""JSON IO for UniLumos schedule metadata."""
++
++from __future__ import annotations
++
++import json
++import os
++import subprocess
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Iterable
++
++
++def to_float_list(values: Iterable[float] | None) -> list[float] | None:
++    if values is None:
++        return None
++    return [float(value) for value in values]
++
++
++def to_int_list(values) -> list[int] | None:
++    if values is None:
++        return None
++    if hasattr(values, "detach"):
++        values = values.detach().cpu().tolist()
++    return [int(value) for value in values]
++
++
++def find_git_root(start: str | os.PathLike | None = None) -> Path | None:
++    current = Path(start or os.getcwd()).resolve()
++    if current.is_file():
++        current = current.parent
++    for candidate in (current, *current.parents):
++        if (candidate / ".git").exists():
++            return candidate
++    return None
++
++
++def git_commit(start: str | os.PathLike | None = None) -> str | None:
++    root = find_git_root(start)
++    if root is None:
++        return None
++    try:
++        return subprocess.check_output(
++            ["git", "-C", str(root), "rev-parse", "HEAD"],
++            text=True,
++            stderr=subprocess.DEVNULL,
++        ).strip()
++    except Exception:
++        return None
++
++
++def git_dirty(start: str | os.PathLike | None = None) -> bool | None:
++    root = find_git_root(start)
++    if root is None:
++        return None
++    try:
++        status = subprocess.check_output(
++            ["git", "-C", str(root), "status", "--short"],
++            text=True,
++            stderr=subprocess.DEVNULL,
++        )
++        return bool(status.strip())
++    except Exception:
++        return None
++
++
++def load_custom_sigmas(path: str | os.PathLike) -> list[float]:
++    source = Path(path)
++    if source.suffix.lower() == ".npy":
++        import numpy as np
++
++        return [float(value) for value in np.load(source).tolist()]
++
++    with source.open("r", encoding="utf-8") as handle:
++        data = json.load(handle)
++    if isinstance(data, dict):
++        values = data.get("final_sigmas") or data.get("sigmas") or data.get("base_sigmas")
++    else:
++        values = data
++    if values is None:
++        raise ValueError(f"No sigmas found in custom schedule: {source}")
++    return [float(value) for value in values]
++
++
++def build_schedule_payload(
++    *,
++    method: str,
++    sampler_mode: str,
++    sample_steps: int,
++    sample_shift: float,
++    base_sample_steps: int | None,
++    actual_nfe: int,
++    split_pairs,
++    terminal_coord: float,
++    base_sigmas,
++    final_sigmas,
++    timesteps,
++    inserted_midpoints,
++    seed,
++    output_path,
++    metadata: dict | None = None,
++) -> dict:
++    return {
++        "model_name": "UniLumos",
++        "method": method,
++        "sampler_mode": sampler_mode,
++        "sample_steps": int(sample_steps),
++        "sample_shift": float(sample_shift),
++        "base_sample_steps": None if base_sample_steps is None else int(base_sample_steps),
++        "actual_nfe": int(actual_nfe),
++        "split_pairs": split_pairs,
++        "terminal_coord": float(terminal_coord),
++        "base_sigmas": to_float_list(base_sigmas),
++        "final_sigmas": to_float_list(final_sigmas),
++        "timesteps": to_int_list(timesteps),
++        "inserted_midpoints": inserted_midpoints or [],
++        "seed": seed,
++        "output_path": output_path,
++        "git_commit": git_commit(),
++        "code_dirty_flag": git_dirty(),
++        "timestamp": datetime.now(timezone.utc).isoformat(),
++        "metadata": metadata or {},
++    }
++
++
++def dump_schedule_json(path: str | os.PathLike, payload: dict) -> str:
++    target = Path(path)
++    target.parent.mkdir(parents=True, exist_ok=True)
++    with target.open("w", encoding="utf-8") as handle:
++        json.dump(payload, handle, indent=2, sort_keys=True)
++        handle.write("\n")
++    return str(target)
+diff --git a/UniLumos/bss_experiments/unilumos/bss_core/validate.py b/UniLumos/bss_experiments/unilumos/bss_core/validate.py
+new file mode 100644
+index 0000000..3194ed5
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/bss_core/validate.py
+@@ -0,0 +1,80 @@
++"""Schedule validation helpers for UniLumos BSS experiments."""
++
++from __future__ import annotations
++
++from typing import Iterable
++
++from .grids import get_uniform_shifted_sigmas, make_boundary_split_coords, parse_split_pairs
++
++
++def _float_list(values: Iterable[float] | None) -> list[float]:
++    if values is None:
++        return []
++    return [float(v) for v in values]
++
++
++def _close(a: float, b: float, tol: float = 1e-9) -> bool:
++    return abs(float(a) - float(b)) <= tol
++
++
++def _same_list(a: Iterable[float], b: Iterable[float], tol: float = 1e-9) -> bool:
++    a_list = _float_list(a)
++    b_list = _float_list(b)
++    return len(a_list) == len(b_list) and all(_close(x, y, tol) for x, y in zip(a_list, b_list))
++
++
++def _monotone_nonincreasing(values: Iterable[float], tol: float = 1e-9) -> bool:
++    coords = _float_list(values)
++    return all(coords[i] >= coords[i + 1] - tol for i in range(len(coords) - 1))
++
++
++def validate_schedule_payload(payload: dict, raise_on_error: bool = False) -> dict:
++    """Validate one dumped UniLumos schedule JSON payload."""
++
++    checks: list[dict] = []
++
++    def add(name: str, passed: bool, detail: str = "") -> None:
++        checks.append({"name": name, "passed": bool(passed), "detail": detail})
++
++    sampler_mode = payload.get("sampler_mode")
++    sample_steps = int(payload.get("sample_steps", 0) or 0)
++    sample_shift = float(payload.get("sample_shift", 0.0) or 0.0)
++    actual_nfe = int(payload.get("actual_nfe", 0) or 0)
++    final_sigmas = _float_list(payload.get("final_sigmas"))
++    base_sigmas = _float_list(payload.get("base_sigmas"))
++    timesteps = payload.get("timesteps") or []
++
++    add("model_name", payload.get("model_name") == "UniLumos", str(payload.get("model_name")))
++    add("final_sigmas_count", len(final_sigmas) == actual_nfe, f"{len(final_sigmas)} vs {actual_nfe}")
++    add("timesteps_count", len(timesteps) == actual_nfe, f"{len(timesteps)} vs {actual_nfe}")
++    add("model_eval_count", len(final_sigmas) == actual_nfe, f"{len(final_sigmas)} model eval coords")
++    add("monotone_nonincreasing", _monotone_nonincreasing(final_sigmas), str(final_sigmas))
++    add("terminal_recorded", "terminal_coord" in payload, str(payload.get("terminal_coord")))
++
++    if sampler_mode == "uniform":
++        expected = get_uniform_shifted_sigmas(sample_steps, sample_shift)
++        add("uniform_nfe", actual_nfe == sample_steps, f"{actual_nfe} vs {sample_steps}")
++        add("uniform_sigmas_match", _same_list(final_sigmas, expected), "")
++    elif sampler_mode == "bss":
++        base_steps = int(payload.get("base_sample_steps", 0) or 0)
++        split_pairs = parse_split_pairs(payload.get("split_pairs"))
++        terminal = float(payload.get("terminal_coord", 0.0))
++        expected, _ = make_boundary_split_coords(base_sigmas, split_pairs, terminal)
++        uniform_same_nfe = get_uniform_shifted_sigmas(actual_nfe, sample_shift)
++        add("bss_nfe", actual_nfe == sample_steps, f"{actual_nfe} vs {sample_steps}")
++        add("bss_base_nfe", len(base_sigmas) == base_steps, f"{len(base_sigmas)} vs {base_steps}")
++        add("bss_base_plus_midpoints", _same_list(final_sigmas, expected), "")
++        add("bss_not_uniform_same_nfe", not _same_list(final_sigmas, uniform_same_nfe), "")
++        add("bss_preserves_first", bool(final_sigmas and base_sigmas and _close(final_sigmas[0], base_sigmas[0])), "")
++        add("bss_preserves_last_base", any(_close(v, base_sigmas[-1]) for v in final_sigmas) if base_sigmas else False, "")
++    elif sampler_mode == "custom_sigmas":
++        add("custom_sigmas_nfe", actual_nfe == len(final_sigmas), f"{actual_nfe} vs {len(final_sigmas)}")
++    else:
++        add("known_sampler_mode", False, str(sampler_mode))
++
++    ok = all(check["passed"] for check in checks)
++    result = {"ok": ok, "checks": checks}
++    if raise_on_error and not ok:
++        failed = ", ".join(check["name"] for check in checks if not check["passed"])
++        raise AssertionError(f"Schedule validation failed: {failed}")
++    return result
+diff --git a/UniLumos/bss_experiments/unilumos/configs/unilumos_image_smoke.yaml b/UniLumos/bss_experiments/unilumos/configs/unilumos_image_smoke.yaml
+new file mode 100644
+index 0000000..d9b45d4
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/configs/unilumos_image_smoke.yaml
+@@ -0,0 +1,4 @@
++protocol: unilumos_official_image_smoke
++mode: image
++max_cases: 1
++reference_method: reference_uniform25
+diff --git a/UniLumos/bss_experiments/unilumos/configs/unilumos_official_video_smoke.yaml b/UniLumos/bss_experiments/unilumos/configs/unilumos_official_video_smoke.yaml
+new file mode 100644
+index 0000000..55fdba4
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/configs/unilumos_official_video_smoke.yaml
+@@ -0,0 +1,4 @@
++protocol: unilumos_official_protocol_smoke
++mode: abc
++max_cases: 1
++reference_method: reference_uniform25
+diff --git a/UniLumos/bss_experiments/unilumos/configs/unilumos_one_case_smoke.yaml b/UniLumos/bss_experiments/unilumos/configs/unilumos_one_case_smoke.yaml
+new file mode 100644
+index 0000000..f5820e7
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/configs/unilumos_one_case_smoke.yaml
+@@ -0,0 +1,20 @@
++protocol: unilumos_official_protocol_smoke
++mode: abc
++max_cases: 1
++seed: 0
++sample_shift: 8.0
++methods:
++  - method: uniform8
++    sampler_mode: uniform
++    sample_steps: 8
++  - method: uniform10
++    sampler_mode: uniform
++    sample_steps: 10
++  - method: bss10
++    sampler_mode: bss
++    sample_steps: 10
++    base_sample_steps: 8
++    split_pairs: "0,-1"
++  - method: reference_uniform25
++    sampler_mode: uniform
++    sample_steps: 25
+diff --git a/UniLumos/bss_experiments/unilumos/configs/unilumos_quality_ladder.yaml b/UniLumos/bss_experiments/unilumos/configs/unilumos_quality_ladder.yaml
+new file mode 100644
+index 0000000..daaa689
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/configs/unilumos_quality_ladder.yaml
+@@ -0,0 +1,17 @@
++protocol: unilumos_quality_ladder
++mode: abc
++max_cases: 1
++disabled_by_default: true
++methods:
++  - uniform8
++  - uniform10
++  - uniform12
++  - uniform16
++  - uniform20
++  - uniform24
++  - reference_uniform25
++  - bss10
++  - bss12
++  - bss16
++  - bss20
++  - bss24
+diff --git a/UniLumos/bss_experiments/unilumos/docs/lumos_family_notes.md b/UniLumos/bss_experiments/unilumos/docs/lumos_family_notes.md
+new file mode 100644
+index 0000000..fbfe6c7
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/docs/lumos_family_notes.md
+@@ -0,0 +1,20 @@
++# Lumos Family Notes
++
++This is a planning note only. Do not run LumosBench or other baselines during
++the first UniLumos BSS smoke.
++
++| Candidate | Type | Is DiT/flow? | Relighting? | Official examples? | Step count controllable? | BSS feasibility | Use |
++|---|---|---|---|---|---|---|---|
++| UniLumos | Image/video relighting model | Yes, flow matching | Yes | Yes | Yes | Main target | Model B smoke |
++| LumosBench | Benchmark/evaluator | No | Evaluates relighting | JSONLs in tree | Not applicable | Not a sampler target | Appendix controllability |
++| Wan2.1 | Video model/backbone | Likely yes | Generic | External | Likely | Possible later | Generic video DiT |
++| LTX-Video | Video model | Likely yes | Generic | External | Unknown here | Possible later | Appendix candidate |
++| CogVideoX | Video model | Likely yes | Generic | External | Likely | Possible later | Generic video DiT |
++| HunyuanVideo | Video model | Likely yes | Generic | External | Likely | Possible later | Generic video DiT |
++| IC-Light | Image relighting baseline | Not strict here | Yes | External | Pipeline-specific | Not main evidence | Task baseline |
++| Light-A-Video | Video relighting baseline | Unknown here | Yes | External | Pipeline-specific | Not main evidence | Task baseline |
++
++LumosBench evaluates six attributes: direction, light source type, intensity,
++color temperature, temporal dynamics, and optical phenomena. It requires
++Qwen2.5-VL for qualitative scoring, so it is too heavy for the first same-NFE
++smoke.
+diff --git a/UniLumos/bss_experiments/unilumos/docs/relitlive_comparison_protocol.md b/UniLumos/bss_experiments/unilumos/docs/relitlive_comparison_protocol.md
+new file mode 100644
+index 0000000..409c32e
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/docs/relitlive_comparison_protocol.md
+@@ -0,0 +1,19 @@
++# Relit-LiVE Comparison Protocol
++
++Model A used official Relit-LiVE demos and compared:
++
++- fixed8
++- fixed10 uniform
++- BSS-10
++- high-step official reference
++
++The UniLumos Model B smoke mirrors this logic with one official UniLumos
++example row:
++
++- `uniform8`
++- `uniform10`
++- `bss10`
++- `reference_uniform25`
++
++Metrics are computed against the official-default reference, not ground truth.
++The first result should be phrased as official-protocol smoke evidence.
+diff --git a/UniLumos/bss_experiments/unilumos/docs/schedule_contract.md b/UniLumos/bss_experiments/unilumos/docs/schedule_contract.md
+new file mode 100644
+index 0000000..2561894
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/docs/schedule_contract.md
+@@ -0,0 +1,20 @@
++# Schedule Contract
++
++UniLumos official uniform schedule:
++
++```python
++sigma = np.linspace(1, 0, sample_steps + 1)[:sample_steps]
++sigma = sample_shift * sigma / (1 + (sample_shift - 1) * sigma)
++```
++
++BSS actual NFE `T`:
++
++- Build the official base schedule with `T - 2` steps.
++- Insert one linear midpoint between `base[0]` and `base[1]`.
++- Insert one linear midpoint between `base[-1]` and terminal coordinate `0.0`.
++- Run exactly `T` model evaluations.
++
++Default split pairs are `0,-1`.
++
++Uniform `T` and BSS `T` are intentionally different schedules at the same NFE.
++The scheduler must dump schedule JSON for every run used in a table.
+diff --git a/UniLumos/bss_experiments/unilumos/docs/unilumos_integration.md b/UniLumos/bss_experiments/unilumos/docs/unilumos_integration.md
+new file mode 100644
+index 0000000..2f28276
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/docs/unilumos_integration.md
+@@ -0,0 +1,31 @@
++# UniLumos Integration
++
++Patched entry points:
++
++- `UniLumos/unilumos_infer_abc.py`
++- `UniLumos/unilumos_infer_ab.py`
++- `UniLumos/unilumos_infer_ac.py`
++- `UniLumos/unilumos_infer_a.py`
++- `UniLumos/unilumos_infer_image.py`
++- `UniLumos/src/schedulers/RFLOW_WANX21_T2V.py`
++
++Added CLI controls:
++
++- `--sample_steps`
++- `--sample_shift`
++- `--seed`
++- `--sampler_mode uniform|bss|custom_sigmas`
++- `--base_sample_steps`
++- `--split_pairs`
++- `--custom_sigmas`
++- `--dump_schedule_json`
++- `--method`
++- `--max_cases`
++- `--case_filter`
++
++The official uniform path still calls `get_sampling_sigmas(sample_steps,
++sample_shift)` and then `retrieve_timesteps(..., sigmas=sampling_sigmas,
++shift=1)`.
++
++Colab execution should run from the inner UniLumos code directory, with
++`PYTHONPATH` including both the task root and the code root.
+diff --git a/UniLumos/bss_experiments/unilumos/figures/.gitkeep b/UniLumos/bss_experiments/unilumos/figures/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/UniLumos/bss_experiments/unilumos/notebooks/unilumos_bss_official_smoke.ipynb b/UniLumos/bss_experiments/unilumos/notebooks/unilumos_bss_official_smoke.ipynb
+new file mode 100644
+index 0000000..8ea308a
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/notebooks/unilumos_bss_official_smoke.ipynb
+@@ -0,0 +1,191 @@
++{
++  "cells": [
++    {
++      "cell_type": "markdown",
++      "metadata": {},
++      "source": [
++        "# UniLumos BSS Official-Protocol Smoke\n",
++        "\n",
++        "This notebook prepares a one-case UniLumos BSS smoke run for Colab. It does not run the model unless `RUN_SMOKE` is set to `True`."
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "from pathlib import Path\n",
++        "import os, sys, json, subprocess\n",
++        "\n",
++        "IN_COLAB = Path('/content').exists()\n",
++        "if IN_COLAB:\n",
++        "    from google.colab import drive\n",
++        "    drive.mount('/content/drive')\n",
++        "\n",
++        "IN_COLAB"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "TASK_ROOT_CANDIDATES = [\n",
++        "    Path('/content/drive/MyDrive/Colab_Projects/Lumos-Custom/UniLumos'),\n",
++        "    Path('/content/Lumos-Custom/UniLumos'),\n",
++        "    Path.cwd(),\n",
++        "]\n",
++        "TASK_ROOT = next((p for p in TASK_ROOT_CANDIDATES if (p / 'UniLumos' / 'unilumos_infer_abc.py').exists()), TASK_ROOT_CANDIDATES[0])\n",
++        "CODE_ROOT = TASK_ROOT / 'UniLumos'\n",
++        "WEIGHTS_ROOT = Path('/content/drive/MyDrive/Colab_Projects/UniLumos/weights')\n",
++        "EXP_ROOT = Path('/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1')\n",
++        "\n",
++        "os.environ['PYTHONPATH'] = f\"{TASK_ROOT}:{CODE_ROOT}:\" + os.environ.get('PYTHONPATH', '')\n",
++        "print('TASK_ROOT =', TASK_ROOT)\n",
++        "print('CODE_ROOT =', CODE_ROOT)\n",
++        "print('WEIGHTS_ROOT =', WEIGHTS_ROOT)\n",
++        "print('EXP_ROOT =', EXP_ROOT)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "required = [\n",
++        "    CODE_ROOT / 'examples' / 'examples_refined.csv',\n",
++        "    CODE_ROOT / 'unilumos_infer_abc.py',\n",
++        "    CODE_ROOT / 'src' / 'schedulers' / 'RFLOW_WANX21_T2V.py',\n",
++        "]\n",
++        "weights = [\n",
++        "    WEIGHTS_ROOT / 'models_t5_umt5-xxl-enc-bf16.pth',\n",
++        "    WEIGHTS_ROOT / 'umt5-xxl',\n",
++        "    WEIGHTS_ROOT / 'vae.pth',\n",
++        "    WEIGHTS_ROOT / 'unilumos.pt',\n",
++        "]\n",
++        "for p in required + weights:\n",
++        "    print(('OK      ' if p.exists() else 'MISSING '), p)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "from bss_experiments.unilumos.bss_core.grids import get_uniform_shifted_sigmas, make_boundary_split_coords\n",
++        "from bss_experiments.unilumos.bss_core.validate import validate_schedule_payload\n",
++        "\n",
++        "base8 = get_uniform_shifted_sigmas(8, 8.0)\n",
++        "bss10, meta = make_boundary_split_coords(base8)\n",
++        "payload = {\n",
++        "    'model_name': 'UniLumos', 'method': 'bss10', 'sampler_mode': 'bss',\n",
++        "    'sample_steps': 10, 'sample_shift': 8.0, 'base_sample_steps': 8,\n",
++        "    'actual_nfe': 10, 'split_pairs': '0,-1', 'terminal_coord': 0.0,\n",
++        "    'base_sigmas': base8, 'final_sigmas': bss10, 'timesteps': list(range(10)),\n",
++        "}\n",
++        "validate_schedule_payload(payload)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "manifest_cmd = [\n",
++        "    sys.executable,\n",
++        "    str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'make_manifest_unilumos_official_smoke.py'),\n",
++        "    '--experiment_root', str(EXP_ROOT),\n",
++        "    '--max_cases', '1',\n",
++        "    '--mode', 'abc',\n",
++        "]\n",
++        "manifest_path = subprocess.check_output(manifest_cmd, text=True).strip()\n",
++        "manifest_path"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "dry_run_cmd = [\n",
++        "    sys.executable,\n",
++        "    str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'run_manifest.py'),\n",
++        "    '--manifest', manifest_path,\n",
++        "    '--weights_root', str(WEIGHTS_ROOT),\n",
++        "    '--dry_run',\n",
++        "]\n",
++        "subprocess.check_call(dry_run_cmd)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "RUN_SMOKE = False\n",
++        "if RUN_SMOKE:\n",
++        "    run_cmd = [\n",
++        "        sys.executable,\n",
++        "        str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'run_manifest.py'),\n",
++        "        '--manifest', manifest_path,\n",
++        "        '--weights_root', str(WEIGHTS_ROOT),\n",
++        "        '--resume',\n",
++        "    ]\n",
++        "    subprocess.check_call(run_cmd)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "if RUN_SMOKE:\n",
++        "    schedule_paths = sorted((EXP_ROOT / 'schedules').glob('*_schedule.json'))\n",
++        "    validate_cmd = [sys.executable, str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'validate_schedules.py'), *map(str, schedule_paths)]\n",
++        "    subprocess.check_call(validate_cmd)"
++      ]
++    },
++    {
++      "cell_type": "code",
++      "execution_count": null,
++      "metadata": {},
++      "outputs": [],
++      "source": [
++        "if RUN_SMOKE:\n",
++        "    metrics_cmd = [\n",
++        "        sys.executable,\n",
++        "        str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'compute_metrics_against_ref.py'),\n",
++        "        '--manifest', manifest_path,\n",
++        "    ]\n",
++        "    metrics_csv = subprocess.check_output(metrics_cmd, text=True).strip()\n",
++        "    table_cmd = [\n",
++        "        sys.executable,\n",
++        "        str(TASK_ROOT / 'bss_experiments' / 'unilumos' / 'scripts' / 'make_main_table.py'),\n",
++        "        '--metrics_csv', metrics_csv,\n",
++        "    ]\n",
++        "    subprocess.check_call(table_cmd)"
++      ]
++    }
++  ],
++  "metadata": {
++    "kernelspec": {
++      "display_name": "Python 3",
++      "language": "python",
++      "name": "python3"
++    },
++    "language_info": {
++      "name": "python",
++      "pygments_lexer": "ipython3"
++    }
++  },
++  "nbformat": 4,
++  "nbformat_minor": 5
++}
+diff --git a/UniLumos/bss_experiments/unilumos/patches/.gitkeep b/UniLumos/bss_experiments/unilumos/patches/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/UniLumos/bss_experiments/unilumos/reports/00_current_state.md b/UniLumos/bss_experiments/unilumos/reports/00_current_state.md
+new file mode 100644
+index 0000000..cbe7c06
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/reports/00_current_state.md
+@@ -0,0 +1,106 @@
++# Phase 0 Current State Audit
++
++Date: 2026-06-23
++
++This audit was run in local code-edit mode. Model execution is intended for
++Google Colab with weights stored on Google Drive. No model inference, training,
++dependency installation, or weight modification was performed locally.
++
++## Environment
++
++| Item | Value |
++|---|---|
++| Local pwd | `E:\UniLumos` |
++| Task root | `E:\UniLumos\UniLumos` |
++| UniLumos code root | `E:\UniLumos\UniLumos\UniLumos` |
++| Git remote | `origin https://github.com/alibaba-damo-academy/Lumos-Custom.git` |
++| Current branch | `bss-unilumos-official-smoke` |
++| HEAD | `1856e13710758c7e81686263d8b8a58cc83c99b8` |
++| Git status before edits | `?? Prompt.txt` |
++| Python | `Python 3.14.2` from WindowsApps/local Python launcher |
++| Local GPU | `NVIDIA GeForce RTX 5080, 16303 MiB, driver 591.86` |
++| Colab | Not local Colab |
++| Google Drive mounted | Not mounted locally |
++
++## Repository Notes
++
++The upstream repository contains a Windows-incompatible file path:
++`UniLumos/LumosBench/requirements.txt ` with a trailing space. The local clone
++uses sparse checkout and keeps the main UniLumos project checked out. LumosBench
++is audited through Git tree reads instead of full checkout.
++
++## File Audit
++
++| Item | Found? | Path / Evidence | Notes | Missing action |
++|---|---:|---|---|---|
++| Prompt backup | Yes | `Prompt.txt` | User reference file, untracked | Do not include in commit unless requested |
++| Top-level UniLumos README | Yes | `UniLumos/README.md` | Checked out | None |
++| Main code root | Yes | `UniLumos/UniLumos` | Contains inference scripts, src, examples, weights | None |
++| `run_infer.sh` | Yes | `UniLumos/UniLumos/run_infer.sh` | Official command runs `torchrun --nproc_per_node=1 unilumos_infer_abc.py` | Update docs/runner, preserve official script unless needed |
++| `unilumos_infer_abc.py` | Yes | `UniLumos/UniLumos/unilumos_infer_abc.py` | Captions + foreground + background | Patch schedule CLI |
++| `unilumos_infer_ab.py` | Yes | `UniLumos/UniLumos/unilumos_infer_ab.py` | Captions + foreground | Patch schedule CLI |
++| `unilumos_infer_ac.py` | Yes | `UniLumos/UniLumos/unilumos_infer_ac.py` | Captions + background | Patch schedule CLI |
++| `unilumos_infer_a.py` | Yes | `UniLumos/UniLumos/unilumos_infer_a.py` | Captions only | Patch schedule CLI |
++| `unilumos_infer_image.py` | Yes | `UniLumos/UniLumos/unilumos_infer_image.py` | Image/single-frame path | Patch schedule CLI |
++| `RFLOW_WANX21_T2V.py` | Yes | `UniLumos/UniLumos/src/schedulers/RFLOW_WANX21_T2V.py` | Has `get_sampling_sigmas` and `retrieve_timesteps(sigmas=...)` | Add BSS/custom schedule mode |
++| `rectified_flow.py` | Yes | `UniLumos/UniLumos/src/schedulers/rectified_flow.py` | `set_timesteps` supports custom `sigmas` | No direct patch expected |
++| Official examples | Yes | `UniLumos/UniLumos/examples` | `examples_refined.csv`, 4 foreground examples, 5 backgrounds each, official generated sample outputs | Use one CSV row for first smoke |
++| Weights | Placeholder only | `UniLumos/UniLumos/weights/readme.txt` | Required model files are missing locally | Provide weights on Colab/Drive |
++| LumosBench | Git tree only | `git ls-tree HEAD UniLumos/LumosBench` | Sparse checkout excludes trailing-space requirements path | Audit only; do not run now |
++
++## Code Search Findings
++
++| Search item | Found? | Evidence | Notes | Missing action |
++|---|---:|---|---|---|
++| `sample_steps` | Yes | All five inference scripts pass `sample_steps=25`; scheduler default is 25 | Hard-coded in inference | Replace with CLI arg |
++| `sample_shift` | Yes | All five inference scripts pass `sample_shift=8.0`; scheduler default is 8.0 | Hard-coded in inference | Replace with CLI arg |
++| `RFLOW_WANX21_T2V` | Yes | Imported by all five inference scripts | Single scheduler integration point | Patch scheduler only |
++| `get_sampling_sigmas` | Yes | `RFLOW_WANX21_T2V.py` lines near top | Official shifted sigma formula | Reuse exactly for uniform/base |
++| `retrieve_timesteps` | Yes | `RFLOW_WANX21_T2V.py` supports `sigmas` | Custom sigma hook exists | Pass BSS/custom sigmas |
++| `set_timesteps` | Yes | `rectified_flow.py` accepts `sigmas` | Appends terminal sigma internally | Keep terminal coord recorded as `0.0` |
++| `manual_seed` | Yes | All five inference scripts use `manual_seed(0)` | Noise seed hard-coded | Replace with `args.seed` |
++| `set_random_seed` | Yes | All five inference scripts use `set_random_seed(seed=0)` | Global seed hard-coded | Replace with `args.seed` |
++| Output save paths | Yes | `save_dir` defaults to official examples results dirs | Must avoid overwriting official results | Runner uses separate experiment output root |
++
++## Official Example Inputs
++
++`examples_refined.csv` is present. The first row is an `abc` case:
++
++- foreground/reference: `./examples/example_0/example_0.mp4`
++- mask: `./examples/example_0/example_0_mask.mp4`
++- degradation: `./examples/example_0/example_0.mp4`
++- background: `examples/example_0/bg_path/bg_video_1.mp4`
++- size: `480x832`
++- duration: `4.08`
++
++## Weights
++
++Local `weights` contains only `readme.txt`. Expected runtime files include:
++
++- `weights/models_t5_umt5-xxl-enc-bf16.pth`
++- `weights/umt5-xxl`
++- `weights/vae.pth`
++- `weights/unilumos.pt`
++
++No local smoke result can be produced without these. The planned notebook and
++runner allow these paths to point at Google Drive.
++
++## LumosBench Audit
++
++LumosBench exists in the Git tree and includes:
++
++- `assets/pipline_caption.jpg`
++- `jsonls/gen_prompts.py`
++- `jsonls/lighting_combinations.jsonl`
++- `jsonls/test_gen_videos.jsonl`
++- `main.py`
++- `src/_predictor.py`
++- `src/_prompts.py`
++- `src/_quantitative_utils.py`
++- `src/_vllm_model.py`
++- `weights/readme.txt`
++
++Its README says it evaluates six lighting attributes: direction, light source
++type, intensity, color temperature, temporal dynamics, and optical phenomena.
++It requires Qwen2.5-VL weights for the qualitative VLM evaluation. This is too
++heavy for the first BSS same-NFE smoke and should remain appendix/planning work.
+diff --git a/UniLumos/bss_experiments/unilumos/reports/01_dry_run_commands.md b/UniLumos/bss_experiments/unilumos/reports/01_dry_run_commands.md
+new file mode 100644
+index 0000000..231e48f
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/reports/01_dry_run_commands.md
+@@ -0,0 +1,38 @@
++# Dry Run Commands
++
++Local validation generated the expected one-case commands for:
++
++- `uniform8`
++- `uniform10`
++- `bss10`
++- `reference_uniform25`
++
++Colab command template:
++
++```bash
++python bss_experiments/unilumos/scripts/make_manifest_unilumos_official_smoke.py \
++  --experiment_root /content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1 \
++  --max_cases 1 \
++  --mode abc
++```
++
++Then dry-run:
++
++```bash
++python bss_experiments/unilumos/scripts/run_manifest.py \
++  --manifest /content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1/manifests/unilumos_official_smoke_manifest.csv \
++  --weights_root /content/drive/MyDrive/Colab_Projects/UniLumos/weights \
++  --dry_run
++```
++
++Then execute after verifying Drive weights:
++
++```bash
++python bss_experiments/unilumos/scripts/run_manifest.py \
++  --manifest /content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1/manifests/unilumos_official_smoke_manifest.csv \
++  --weights_root /content/drive/MyDrive/Colab_Projects/UniLumos/weights \
++  --resume
++```
++
++The runner executes from the inner `UniLumos` code directory and writes outputs,
++logs, schedules, metrics, and figures under the experiment root.
+diff --git a/UniLumos/bss_experiments/unilumos/reports/02_one_case_smoke_report.md b/UniLumos/bss_experiments/unilumos/reports/02_one_case_smoke_report.md
+new file mode 100644
+index 0000000..fda6397
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/reports/02_one_case_smoke_report.md
+@@ -0,0 +1,24 @@
++# One-Case Smoke Report
++
++Status: pending Colab execution.
++
++Local code-only validation completed:
++
++- Python syntax parse passed for BSS scripts, patched inference scripts, and scheduler.
++- Toy BSS validation passed for `bss10 = base8 + split first/last`.
++- Manifest generation passed for first official `abc` case.
++- Runner dry-run produced four commands: `uniform8`, `uniform10`, `bss10`, and `reference_uniform25`.
++
++Selected smoke case:
++
++- `case_id`: `example_0_bg_video_1`
++- mode: `abc`
++- foreground/reference: `./examples/example_0/example_0.mp4`
++- mask: `./examples/example_0/example_0_mask.mp4`
++- degradation: `./examples/example_0/example_0.mp4`
++- background: `examples/example_0/bg_path/bg_video_1.mp4`
++- reference method: `reference_uniform25`
++
++Local weights are missing, so no output videos or metrics were generated
++locally. Execute the notebook in Colab with Drive weights to complete this
++report.
+diff --git a/UniLumos/bss_experiments/unilumos/reports/03_result_interpretation.md b/UniLumos/bss_experiments/unilumos/reports/03_result_interpretation.md
+new file mode 100644
+index 0000000..25a29aa
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/reports/03_result_interpretation.md
+@@ -0,0 +1,18 @@
++# Result Interpretation
++
++Pending Colab execution.
++
++Use this wording after metrics are available:
++
++- On this UniLumos official-protocol smoke case, BSS-10 does or does not improve
++  over uniform10 at the same NFE.
++- Reference is `uniform25`, the official default schedule, not ground truth.
++- This is cross-model smoke evidence, not final generality.
++
++Decision rule for the first smoke:
++
++- Primary same-NFE comparison: `bss10` versus `uniform10`.
++- Reference closure target: `reference_uniform25`.
++- BSS win if `bss10` improves RGB L1 or temporal reference error versus
++  `uniform10`; stronger if both improve.
++- If the smoke fails due to runtime/weights, do not run the ladder.
+diff --git a/UniLumos/bss_experiments/unilumos/reports/FINAL_UNILUMOS_BSS_SMOKE_REPORT.md b/UniLumos/bss_experiments/unilumos/reports/FINAL_UNILUMOS_BSS_SMOKE_REPORT.md
+new file mode 100644
+index 0000000..4c05ac1
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/reports/FINAL_UNILUMOS_BSS_SMOKE_REPORT.md
+@@ -0,0 +1,65 @@
++# Final UniLumos BSS Smoke Report
++
++Status: code scaffold and schedule integration prepared locally. Local
++lightweight validation passed. Model smoke execution is intended for Colab with
++weights on Google Drive.
++
++## Purpose
++
++Create a UniLumos official-protocol smoke test for Boundary-Split Sampling as
++Model B evidence beyond Relit-LiVE.
++
++## Relation To Model A
++
++The one-case smoke mirrors the Relit-LiVE comparison structure:
++`uniform8`, `uniform10`, `bss10`, and a high/default reference. For UniLumos,
++the initial reference is `uniform25`, matching the official default in the
++inference scripts.
++
++## Environment And Git State
++
++See `reports/00_current_state.md`.
++
++## Selected Protocol
++
++Initial mode: `abc`, using one row from official `examples_refined.csv`.
++
++Fallback order remains `abc`, `ab`, `ac`, `a`, then `image`.
++
++## BSS Implementation Summary
++
++BSS is implemented only as a sigma-grid modification in
++`RFLOW_WANX21_T2V.sample`. Uniform sampling still uses the official
++`get_sampling_sigmas(sample_steps, sample_shift)` path.
++
++## Local Validation
++
++- Parsed 23 Python files with AST parsing.
++- Validated toy bss10 = base8 + split first/last.
++- Confirmed bss10 has 10 coordinates and is not uniform10.
++- Generated a one-case manifest in a temporary folder.
++- Dry-ran the runner and produced commands for uniform8, uniform10, bss10, and reference_uniform25.
++- Validated notebook JSON.
++
++## Schedule Validation
++Toy validation passed locally. Full schedule JSON validation is pending Colab run output.
++
++## One-Case Smoke Results
++
++Pending Colab run.
++
++## Side-By-Side Outputs
++
++Pending Colab run.
++
++## Lumos Family Summary
++
++UniLumos is the Model B target. LumosBench is better reserved for later
++attribute controllability evaluation and should not be part of the first
++same-NFE sampler smoke.
++
++## Verdict
++
++Run the notebook in Colab with Drive weights. If schedule validation and one
++case outputs pass, expand to more official UniLumos examples. If video mode is
++too heavy or weights are unavailable, fall back to image mode.
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/audit_lumos_family.py b/UniLumos/bss_experiments/unilumos/scripts/audit_lumos_family.py
+new file mode 100644
+index 0000000..1692d97
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/audit_lumos_family.py
+@@ -0,0 +1,42 @@
++#!/usr/bin/env python
++"""Write a planning audit for LumosBench and related baselines."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++
++TASK_ROOT = Path(__file__).resolve().parents[3]
++
++
++def main() -> None:
++    out = TASK_ROOT / "bss_experiments" / "unilumos" / "docs" / "lumos_family_notes.md"
++    out.parent.mkdir(parents=True, exist_ok=True)
++    out.write_text(
++        """# Lumos Family Notes
++
++This is a planning audit only. Do not run these baselines in the first BSS smoke.
++
++| Candidate | Type | Is DiT/flow? | Relighting? | Official examples? | Step count controllable? | BSS feasibility | Use |
++|---|---|---|---|---|---|---|---|
++| UniLumos | Image/video relighting model | Yes, flow-matching backbone | Yes | Yes | Yes, `sample_steps` and `sample_shift` | Main target | Model B smoke |
++| LumosBench | Attribute benchmark | No, evaluation suite | Evaluates relighting outputs | JSONLs in repo tree | Not applicable | Not a sampler target | Appendix controllability evaluation |
++| Wan2.1 | Video generation backbone | Likely yes | Generic backbone | External | Likely schedule-controlled | Possible but out of scope | Later generic video DiT |
++| CogVideoX | Video generation model | Likely yes | Generic | External | Likely schedule-controlled | Possible but separate | Later generic video DiT |
++| HunyuanVideo | Video generation model | Likely yes | Generic | External | Likely schedule-controlled | Possible but separate | Later generic video DiT |
++| LTX-Video | Video generation model | Likely yes | Generic | External | Unknown in this repo | Possible but separate | Appendix candidate |
++| IC-Light | Image relighting baseline | Not strict evidence here | Yes | External | Pipeline-specific | Not main BSS evidence | Task baseline |
++| Light-A-Video | Video lighting baseline | Unknown here | Yes | External | Pipeline-specific | Not main BSS evidence | Task baseline |
++
++LumosBench evaluates six lighting attributes: direction, light source type,
++intensity, color temperature, temporal dynamics, and optical phenomena. It uses
++Qwen2.5-VL for model-based qualitative scoring, so it is too heavy for the
++first same-NFE BSS smoke.
++""",
++        encoding="utf-8",
++    )
++    print(out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/compute_metrics_against_ref.py b/UniLumos/bss_experiments/unilumos/scripts/compute_metrics_against_ref.py
+new file mode 100644
+index 0000000..5a1f52d
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/compute_metrics_against_ref.py
+@@ -0,0 +1,81 @@
++#!/usr/bin/env python
++"""Compute lightweight output metrics against the reference row."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import sys
++from pathlib import Path
++
++TASK_ROOT = Path(__file__).resolve().parents[3]
++if str(TASK_ROOT) not in sys.path:
++    sys.path.insert(0, str(TASK_ROOT))
++
++from bss_experiments.unilumos.bss_core.manifest import read_manifest
++from bss_experiments.unilumos.bss_core.metrics import compute_against_reference
++
++
++def existing_output(stem: str) -> Path | None:
++    base = Path(stem)
++    for suffix in ("", ".mp4", ".png", ".jpg", ".jpeg"):
++        candidate = Path(str(base) + suffix)
++        if candidate.exists():
++            return candidate
++    return None
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifest", required=True, type=Path)
++    parser.add_argument("--output_csv", type=Path, default=None)
++    parser.add_argument("--max_frames", type=int, default=None)
++    args = parser.parse_args()
++
++    rows = read_manifest(args.manifest)
++    by_case = {}
++    for row in rows:
++        by_case.setdefault(row["case_id"], []).append(row)
++
++    metric_rows = []
++    for case_id, case_rows in by_case.items():
++        ref_row = next((row for row in case_rows if row["method_family"] == "reference"), None)
++        if ref_row is None:
++            continue
++        ref_path = existing_output(ref_row["output_path"])
++        if ref_path is None:
++            continue
++        baseline_row = next((row for row in case_rows if row["method"] == "uniform8"), None)
++        baseline_path = existing_output(baseline_row["output_path"]) if baseline_row else None
++        baseline_metrics = None
++        if baseline_path:
++            baseline_metrics = compute_against_reference(baseline_path, ref_path, max_frames=args.max_frames)
++
++        for row in case_rows:
++            out_path = existing_output(row["output_path"])
++            if out_path is None:
++                continue
++            metrics = compute_against_reference(out_path, ref_path, max_frames=args.max_frames)
++            if baseline_metrics:
++                metrics["rgb_l1_closure"] = 1.0 - metrics["rgb_l1"] / max(baseline_metrics["rgb_l1"], 1e-12)
++                metrics["temporal_closure"] = 1.0 - metrics["temporal_diff_l1_to_ref"] / max(
++                    baseline_metrics["temporal_diff_l1_to_ref"], 1e-12
++                )
++            metric_rows.append({**row, **metrics, "resolved_output_path": str(out_path), "reference_path": str(ref_path)})
++
++    output_csv = args.output_csv or args.manifest.parent.parent / "metrics" / "metrics_against_ref.csv"
++    output_csv.parent.mkdir(parents=True, exist_ok=True)
++    if metric_rows:
++        fields = list(metric_rows[0].keys())
++        with output_csv.open("w", encoding="utf-8", newline="") as handle:
++            writer = csv.DictWriter(handle, fieldnames=fields)
++            writer.writeheader()
++            writer.writerows(metric_rows)
++    output_json = output_csv.with_suffix(".json")
++    output_json.write_text(json.dumps(metric_rows, indent=2) + "\n", encoding="utf-8")
++    print(output_csv)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/make_main_table.py b/UniLumos/bss_experiments/unilumos/scripts/make_main_table.py
+new file mode 100644
+index 0000000..04d20e2
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/make_main_table.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python
++"""Create the main one-case smoke markdown table."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++from pathlib import Path
++
++
++METHOD_ORDER = ["uniform8", "uniform10", "bss10", "reference_uniform25"]
++
++
++def fmt(value: str, digits: int = 6) -> str:
++    try:
++        return f"{float(value):.{digits}g}"
++    except Exception:
++        return ""
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--metrics_csv", required=True, type=Path)
++    parser.add_argument("--output_md", type=Path, default=None)
++    args = parser.parse_args()
++
++    with args.metrics_csv.open("r", encoding="utf-8", newline="") as handle:
++        rows = list(csv.DictReader(handle))
++    rows.sort(key=lambda row: METHOD_ORDER.index(row["method"]) if row["method"] in METHOD_ORDER else 999)
++    out = args.output_md or args.metrics_csv.parent.parent / "tables" / "main_smoke_table.md"
++    out.parent.mkdir(parents=True, exist_ok=True)
++
++    uniform10 = next((row for row in rows if row["method"] == "uniform10"), None)
++    bss10 = next((row for row in rows if row["method"] == "bss10"), None)
++    bss_win = ""
++    if uniform10 and bss10:
++        bss_win = str(
++            float(bss10.get("rgb_l1", "inf")) < float(uniform10.get("rgb_l1", "inf"))
++            or float(bss10.get("temporal_diff_l1_to_ref", "inf"))
++            < float(uniform10.get("temporal_diff_l1_to_ref", "inf"))
++        )
++
++    with out.open("w", encoding="utf-8") as handle:
++        handle.write("| Method | NFE | RGB L1 low | RGB L2 low | PSNR high | Temporal ref-error low | RGB closure high | Temporal closure high | BSS win vs uniform10 |\n")
++        handle.write("|---|---:|---:|---:|---:|---:|---:|---:|---|\n")
++        for row in rows:
++            handle.write(
++                f"| {row['method']} | {row['actual_nfe']} | {fmt(row.get('rgb_l1', ''))} | "
++                f"{fmt(row.get('rgb_l2', ''))} | {fmt(row.get('psnr', ''))} | "
++                f"{fmt(row.get('temporal_diff_l1_to_ref', ''))} | {fmt(row.get('rgb_l1_closure', ''))} | "
++                f"{fmt(row.get('temporal_closure', ''))} | {bss_win if row['method'] == 'bss10' else ''} |\n"
++            )
++    print(out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/make_manifest_unilumos_official_smoke.py b/UniLumos/bss_experiments/unilumos/scripts/make_manifest_unilumos_official_smoke.py
+new file mode 100644
+index 0000000..8f3ee1b
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/make_manifest_unilumos_official_smoke.py
+@@ -0,0 +1,170 @@
++#!/usr/bin/env python
++"""Create a one-case UniLumos official-protocol BSS smoke manifest."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import hashlib
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++
++TASK_ROOT = Path(__file__).resolve().parents[3]
++CODE_ROOT = TASK_ROOT / "UniLumos"
++DEFAULT_RUN_NAME = "model_b_unilumos_official_bss_smoke_v1"
++if str(TASK_ROOT) not in sys.path:
++    sys.path.insert(0, str(TASK_ROOT))
++
++from bss_experiments.unilumos.bss_core.manifest import write_manifest
++
++
++def default_experiment_root() -> Path:
++    drive = Path("/content/drive/MyDrive")
++    if drive.exists():
++        return drive / "Colab_Projects" / "UniLumos-BSS-Runs" / DEFAULT_RUN_NAME
++    if Path("/content").exists():
++        return Path("/content/UniLumos-BSS-Runs") / DEFAULT_RUN_NAME
++    return TASK_ROOT / "bss_runs" / DEFAULT_RUN_NAME
++
++
++def git_value(args: list[str]) -> str:
++    try:
++        return subprocess.check_output(["git", "-C", str(TASK_ROOT.parent), *args], text=True).strip()
++    except Exception:
++        return ""
++
++
++def dirty_flag() -> str:
++    return "true" if git_value(["status", "--short"]) else "false"
++
++
++def load_cases(data_path: Path, max_cases: int) -> list[dict]:
++    with data_path.open("r", encoding="utf-8", newline="") as handle:
++        rows = list(csv.DictReader(handle))
++    if not rows:
++        raise RuntimeError(f"No cases found in {data_path}")
++    return rows[:max_cases]
++
++
++def write_case_csv(path: Path, fieldnames: list[str], row: dict) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8", newline="") as handle:
++        writer = csv.DictWriter(handle, fieldnames=fieldnames)
++        writer.writeheader()
++        writer.writerow(row)
++
++
++def method_rows(ladder: bool) -> list[dict]:
++    rows = [
++        {"method": "uniform8", "family": "uniform", "sampler_mode": "uniform", "steps": 8, "base": ""},
++        {"method": "uniform10", "family": "uniform", "sampler_mode": "uniform", "steps": 10, "base": ""},
++        {"method": "bss10", "family": "bss", "sampler_mode": "bss", "steps": 10, "base": 8},
++        {"method": "reference_uniform25", "family": "reference", "sampler_mode": "uniform", "steps": 25, "base": ""},
++    ]
++    if ladder:
++        for steps in (12, 16, 20, 24):
++            rows.append({"method": f"uniform{steps}", "family": "uniform", "sampler_mode": "uniform", "steps": steps, "base": ""})
++            rows.append({"method": f"bss{steps}", "family": "bss", "sampler_mode": "bss", "steps": steps, "base": steps - 2})
++    return rows
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--mode", choices=("abc", "ab", "ac", "a", "image"), default="abc")
++    parser.add_argument("--data_path", type=Path, default=CODE_ROOT / "examples" / "examples_refined.csv")
++    parser.add_argument("--experiment_root", type=Path, default=default_experiment_root())
++    parser.add_argument("--manifest", type=Path, default=None)
++    parser.add_argument("--max_cases", type=int, default=1)
++    parser.add_argument("--sample_shift", type=float, default=8.0)
++    parser.add_argument("--seed", type=int, default=0)
++    parser.add_argument("--ladder", action="store_true")
++    args = parser.parse_args()
++
++    exp_root = args.experiment_root
++    manifest_path = args.manifest or exp_root / "manifests" / "unilumos_official_smoke_manifest.csv"
++    for rel in [
++        "manifests/cases",
++        "logs",
++        "outputs",
++        "schedules",
++        "metrics",
++        "tables",
++        "figures/side_by_side",
++        "reports",
++        "patches",
++        "scripts",
++    ]:
++        (exp_root / rel).mkdir(parents=True, exist_ok=True)
++
++    cases = load_cases(args.data_path, args.max_cases)
++    with args.data_path.open("r", encoding="utf-8", newline="") as handle:
++        fieldnames = list(csv.DictReader(handle).fieldnames or [])
++
++    rows = []
++    commit = git_value(["rev-parse", "HEAD"])
++    for case_index, case in enumerate(cases):
++        foreground = case.get("path", "")
++        background = case.get("bg_path", "")
++        example = case.get("example_folder") or Path(foreground).stem or f"case_{case_index}"
++        bg_id = Path(background).stem if background else "no_bg"
++        case_id = f"{example}_{bg_id}"
++        prompt_hash = hashlib.sha1((case.get("text") or "").encode("utf-8")).hexdigest()[:12]
++
++        for method in method_rows(args.ladder):
++            run_id = f"{case_id}_{method['method']}_seed{args.seed}"
++            case_csv = exp_root / "manifests" / "cases" / f"{run_id}.csv"
++            write_case_csv(case_csv, fieldnames, case)
++            output_stem = exp_root / "outputs" / method["method"] / f"{case_id}_gen"
++            schedule_json = exp_root / "schedules" / f"{run_id}_schedule.json"
++            rows.append(
++                {
++                    "run_id": run_id,
++                    "model_name": "UniLumos",
++                    "protocol": "unilumos_official_protocol_smoke",
++                    "mode": args.mode,
++                    "case_id": case_id,
++                    "foreground_id": Path(foreground).stem,
++                    "background_id": bg_id,
++                    "prompt_hash": prompt_hash,
++                    "method": method["method"],
++                    "method_family": method["family"],
++                    "sampler_mode": method["sampler_mode"],
++                    "sample_steps": method["steps"],
++                    "base_sample_steps": method["base"],
++                    "actual_nfe": method["steps"],
++                    "sample_shift": args.sample_shift,
++                    "split_pairs": "0,-1",
++                    "seed": args.seed,
++                    "input_paths": json.dumps(
++                        {
++                            "path": foreground,
++                            "mask_path": case.get("mask_path", ""),
++                            "deg_path": case.get("deg_path", ""),
++                            "bg_path": background,
++                        },
++                        sort_keys=True,
++                    ),
++                    "checkpoint_paths": json.dumps({"weights_root": "UniLumos/weights"}, sort_keys=True),
++                    "case_data_path": str(case_csv),
++                    "output_path": str(output_stem),
++                    "schedule_json_path": str(schedule_json),
++                    "stdout_log_path": str(exp_root / "logs" / f"{run_id}.stdout.log"),
++                    "stderr_log_path": str(exp_root / "logs" / f"{run_id}.stderr.log"),
++                    "runtime_json_path": str(exp_root / "logs" / f"{run_id}.runtime.json"),
++                    "status": "pending",
++                    "error_message": "",
++                    "git_commit": commit,
++                    "code_dirty_flag": dirty_flag(),
++                }
++            )
++
++    write_manifest(manifest_path, rows)
++    print(manifest_path)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/make_quality_ladder_table.py b/UniLumos/bss_experiments/unilumos/scripts/make_quality_ladder_table.py
+new file mode 100644
+index 0000000..a657120
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/make_quality_ladder_table.py
+@@ -0,0 +1,33 @@
++#!/usr/bin/env python
++"""Create a lightweight quality ladder table from metrics CSV."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++from pathlib import Path
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--metrics_csv", required=True, type=Path)
++    parser.add_argument("--output_md", type=Path, default=None)
++    args = parser.parse_args()
++
++    with args.metrics_csv.open("r", encoding="utf-8", newline="") as handle:
++        rows = list(csv.DictReader(handle))
++    out = args.output_md or args.metrics_csv.parent.parent / "tables" / "quality_ladder_table.md"
++    out.parent.mkdir(parents=True, exist_ok=True)
++    with out.open("w", encoding="utf-8") as handle:
++        handle.write("| Method | Family | NFE | RGB L1 | Temporal ref-error | Notes |\n")
++        handle.write("|---|---|---:|---:|---:|---|\n")
++        for row in sorted(rows, key=lambda item: (int(item.get("actual_nfe") or 0), item["method"])):
++            handle.write(
++                f"| {row['method']} | {row['method_family']} | {row['actual_nfe']} | "
++                f"{row.get('rgb_l1', '')} | {row.get('temporal_diff_l1_to_ref', '')} | |\n"
++            )
++    print(out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/make_side_by_side.py b/UniLumos/bss_experiments/unilumos/scripts/make_side_by_side.py
+new file mode 100644
+index 0000000..852a1f3
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/make_side_by_side.py
+@@ -0,0 +1,75 @@
++#!/usr/bin/env python
++"""Create a simple first-frame side-by-side contact sheet."""
++
++from __future__ import annotations
++
++import argparse
++import csv
++from pathlib import Path
++
++
++def existing_output(stem: str) -> Path | None:
++    base = Path(stem)
++    for suffix in ("", ".mp4", ".png", ".jpg", ".jpeg"):
++        candidate = Path(str(base) + suffix)
++        if candidate.exists():
++            return candidate
++    return None
++
++
++def first_frame(path: Path):
++    import imageio.v3 as iio
++    from PIL import Image
++
++    if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
++        return Image.fromarray(iio.imread(path)).convert("RGB")
++    for frame in iio.imiter(path):
++        return Image.fromarray(frame).convert("RGB")
++    raise RuntimeError(f"No frame found in {path}")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifest", required=True, type=Path)
++    parser.add_argument("--output_dir", type=Path, default=None)
++    args = parser.parse_args()
++
++    with args.manifest.open("r", encoding="utf-8", newline="") as handle:
++        rows = list(csv.DictReader(handle))
++    order = ["uniform8", "uniform10", "bss10", "reference_uniform25"]
++    frames = []
++    labels = []
++    for method in order:
++        row = next((item for item in rows if item["method"] == method), None)
++        if row is None:
++            continue
++        path = existing_output(row["output_path"])
++        if path is None:
++            continue
++        frames.append(first_frame(path))
++        labels.append(method)
++    if not frames:
++        raise RuntimeError("No output media found")
++
++    from PIL import Image, ImageDraw
++
++    height = min(frame.height for frame in frames)
++    resized = [frame.resize((int(frame.width * height / frame.height), height)) for frame in frames]
++    label_h = 32
++    width = sum(frame.width for frame in resized)
++    sheet = Image.new("RGB", (width, height + label_h), "white")
++    draw = ImageDraw.Draw(sheet)
++    x = 0
++    for label, frame in zip(labels, resized):
++        sheet.paste(frame, (x, label_h))
++        draw.text((x + 8, 8), label, fill=(0, 0, 0))
++        x += frame.width
++    out_dir = args.output_dir or args.manifest.parent.parent / "figures" / "side_by_side"
++    out_dir.mkdir(parents=True, exist_ok=True)
++    out = out_dir / "one_case_side_by_side.jpg"
++    sheet.save(out, quality=95)
++    print(out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/run_manifest.py b/UniLumos/bss_experiments/unilumos/scripts/run_manifest.py
+new file mode 100644
+index 0000000..0cf0295
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/run_manifest.py
+@@ -0,0 +1,155 @@
++#!/usr/bin/env python
++"""Run UniLumos BSS manifest rows one at a time."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++
++TASK_ROOT = Path(__file__).resolve().parents[3]
++CODE_ROOT = TASK_ROOT / "UniLumos"
++if str(TASK_ROOT) not in sys.path:
++    sys.path.insert(0, str(TASK_ROOT))
++
++from bss_experiments.unilumos.bss_core.manifest import read_manifest, write_manifest
++SCRIPT_BY_MODE = {
++    "abc": "unilumos_infer_abc.py",
++    "ab": "unilumos_infer_ab.py",
++    "ac": "unilumos_infer_ac.py",
++    "a": "unilumos_infer_a.py",
++    "image": "unilumos_infer_image.py",
++}
++
++
++def split_methods(value: str | None) -> set[str] | None:
++    if not value:
++        return None
++    return {piece.strip() for piece in value.split(",") if piece.strip()}
++
++
++def row_command(row: dict, weights_root: Path, python_bin: str) -> list[str]:
++    mode = row["mode"]
++    script = SCRIPT_BY_MODE[mode]
++    cmd = [
++        python_bin,
++        script,
++        "--data_path",
++        row["case_data_path"],
++        "--save_dir",
++        str(Path(row["output_path"]).parent),
++        "--sample_steps",
++        str(row["sample_steps"]),
++        "--sample_shift",
++        str(row["sample_shift"]),
++        "--seed",
++        str(row["seed"]),
++        "--sampler_mode",
++        row["sampler_mode"],
++        "--split_pairs",
++        row["split_pairs"],
++        "--dump_schedule_json",
++        row["schedule_json_path"],
++        "--method",
++        row["method"],
++        "--max_cases",
++        "1",
++        "--t5_path",
++        str(weights_root / "models_t5_umt5-xxl-enc-bf16.pth"),
++        "--tokenizer_path",
++        str(weights_root / "umt5-xxl"),
++        "--vae_path",
++        str(weights_root / "vae.pth"),
++        "--unilumos_path",
++        str(weights_root / "unilumos.pt"),
++    ]
++    if row.get("base_sample_steps"):
++        cmd.extend(["--base_sample_steps", str(row["base_sample_steps"])])
++    return cmd
++
++
++def write_dry_run_report(path: Path, commands: list[tuple[str, list[str]]]) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    with path.open("w", encoding="utf-8") as handle:
++        handle.write("# Dry Run Commands\n\n")
++        handle.write("These commands are intended for the UniLumos code directory.\n\n")
++        for run_id, cmd in commands:
++            handle.write(f"## {run_id}\n\n")
++            handle.write("```bash\n")
++            handle.write(" ".join(cmd))
++            handle.write("\n```\n\n")
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--manifest", required=True, type=Path)
++    parser.add_argument("--weights_root", type=Path, default=CODE_ROOT / "weights")
++    parser.add_argument("--limit", type=int, default=None)
++    parser.add_argument("--only_methods", type=str, default=None)
++    parser.add_argument("--resume", action="store_true")
++    parser.add_argument("--force", action="store_true")
++    parser.add_argument("--dry_run", action="store_true")
++    parser.add_argument("--sync_drive", action="store_true")
++    parser.add_argument("--python_bin", type=str, default=sys.executable)
++    args = parser.parse_args()
++
++    rows = read_manifest(args.manifest)
++    only_methods = split_methods(args.only_methods)
++    selected = []
++    for index, row in enumerate(rows):
++        if only_methods and row["method"] not in only_methods:
++            continue
++        if args.resume and not args.force and row.get("status") == "done":
++            continue
++        selected.append((index, row))
++        if args.limit is not None and len(selected) >= args.limit:
++            break
++
++    commands = [(row["run_id"], row_command(row, args.weights_root, args.python_bin)) for _, row in selected]
++    exp_root = Path(rows[0]["stdout_log_path"]).parents[1] if rows else args.manifest.parent.parent
++    if args.dry_run:
++        write_dry_run_report(exp_root / "reports" / "01_dry_run_commands.md", commands)
++        for _, cmd in commands:
++            print(" ".join(cmd))
++        return
++
++    env = os.environ.copy()
++    env["PYTHONPATH"] = os.pathsep.join([str(TASK_ROOT), str(CODE_ROOT), env.get("PYTHONPATH", "")])
++
++    for row_index, row in selected:
++        cmd = row_command(row, args.weights_root, args.python_bin)
++        stdout_path = Path(row["stdout_log_path"])
++        stderr_path = Path(row["stderr_log_path"])
++        runtime_path = Path(row["runtime_json_path"])
++        stdout_path.parent.mkdir(parents=True, exist_ok=True)
++        start = time.time()
++        row["status"] = "running"
++        write_manifest(args.manifest, rows)
++        with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open("w", encoding="utf-8") as stderr:
++            proc = subprocess.run(cmd, cwd=CODE_ROOT, env=env, stdout=stdout, stderr=stderr, text=True)
++        elapsed = time.time() - start
++        runtime_path.write_text(
++            json.dumps({"run_id": row["run_id"], "runtime_seconds": elapsed, "returncode": proc.returncode}, indent=2) + "\n",
++            encoding="utf-8",
++        )
++        if proc.returncode == 0:
++            row["status"] = "done"
++            row["error_message"] = ""
++        else:
++            row["status"] = "failed"
++            row["error_message"] = f"returncode={proc.returncode}; see {stderr_path}"
++            write_manifest(args.manifest, rows)
++            raise SystemExit(proc.returncode)
++        write_manifest(args.manifest, rows)
++
++    if args.sync_drive:
++        print("--sync_drive requested; no extra copy needed when experiment_root is already on Drive.")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/run_one_case_smoke.py b/UniLumos/bss_experiments/unilumos/scripts/run_one_case_smoke.py
+new file mode 100644
+index 0000000..cae8c33
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/run_one_case_smoke.py
+@@ -0,0 +1,39 @@
++#!/usr/bin/env python
++"""Convenience wrapper for creating and optionally running the one-case smoke."""
++
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++from pathlib import Path
++
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--experiment_root", type=Path, default=None)
++    parser.add_argument("--weights_root", type=Path, default=None)
++    parser.add_argument("--dry_run", action="store_true")
++    parser.add_argument("--run", action="store_true")
++    args = parser.parse_args()
++
++    manifest_cmd = [sys.executable, str(SCRIPT_DIR / "make_manifest_unilumos_official_smoke.py"), "--max_cases", "1"]
++    if args.experiment_root:
++        manifest_cmd.extend(["--experiment_root", str(args.experiment_root)])
++    manifest = subprocess.check_output(manifest_cmd, text=True).strip()
++    print(manifest)
++
++    if args.dry_run or args.run:
++        run_cmd = [sys.executable, str(SCRIPT_DIR / "run_manifest.py"), "--manifest", manifest]
++        if args.weights_root:
++            run_cmd.extend(["--weights_root", str(args.weights_root)])
++        if args.dry_run:
++            run_cmd.append("--dry_run")
++        subprocess.check_call(run_cmd)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/scripts/validate_schedules.py b/UniLumos/bss_experiments/unilumos/scripts/validate_schedules.py
+new file mode 100644
+index 0000000..7cd42fb
+--- /dev/null
++++ b/UniLumos/bss_experiments/unilumos/scripts/validate_schedules.py
+@@ -0,0 +1,40 @@
++#!/usr/bin/env python
++"""Validate dumped UniLumos schedule JSON files."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++TASK_ROOT = Path(__file__).resolve().parents[3]
++if str(TASK_ROOT) not in sys.path:
++    sys.path.insert(0, str(TASK_ROOT))
++
++from bss_experiments.unilumos.bss_core.validate import validate_schedule_payload
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("paths", nargs="+", type=Path)
++    parser.add_argument("--fail_fast", action="store_true")
++    args = parser.parse_args()
++
++    all_ok = True
++    for path in args.paths:
++        payload = json.loads(path.read_text(encoding="utf-8"))
++        result = validate_schedule_payload(payload)
++        all_ok = all_ok and result["ok"]
++        print(f"{path}: {'ok' if result['ok'] else 'failed'}")
++        for check in result["checks"]:
++            status = "ok" if check["passed"] else "failed"
++            print(f"  {status} {check['name']} {check['detail']}")
++        if args.fail_fast and not result["ok"]:
++            raise SystemExit(1)
++    if not all_ok:
++        raise SystemExit(1)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/UniLumos/bss_experiments/unilumos/tables/.gitkeep b/UniLumos/bss_experiments/unilumos/tables/.gitkeep
+new file mode 100644
+index 0000000..e69de29

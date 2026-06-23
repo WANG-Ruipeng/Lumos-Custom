@@ -1,0 +1,17 @@
+protocol: unilumos_quality_ladder
+mode: abc
+max_cases: 1
+disabled_by_default: true
+methods:
+  - uniform8
+  - uniform10
+  - uniform12
+  - uniform16
+  - uniform20
+  - uniform24
+  - reference_uniform25
+  - bss10
+  - bss12
+  - bss16
+  - bss20
+  - bss24
