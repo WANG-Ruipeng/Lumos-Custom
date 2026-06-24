@@ -1,756 +1,397 @@
-You are working inside our UniLumos fork.
+You are working inside our UniLumos BSS fork.
 
 Goal:
-Run/report UniLumos official demo scenarios in the same reporting style as our Relit-LiVE BSS experiments, but with support-aware cross-model tables.
+Run an offline policy-certification analysis for the completed UniLumos official-demo BSS experiments.
 
-Important philosophy:
-- We want a cross-model, cross-modality reporting format.
-- One row should correspond to one model/protocol.
-- The cross-modality main metric is `rgb_l1_closure`.
-- Do not invent new demo scenarios.
-- Use official UniLumos demo scenarios only.
-- Do not create Cartesian products of foreground/background/prompt assets unless the official script or official manifest already specifies those combinations.
-- Do not train anything.
-- Do not modify weights.
-- Do not change official conditioning, prompts, examples, preprocessing, sample_shift, resolution, checkpoint loading, or model architecture.
-- Only change the inference schedule grid.
+This is NOT a new full model run unless required data is missing.
+This task should mostly read existing UniLumos metrics/manifests/tables and produce statistical certification reports.
 
-BSS definition:
-For actual NFE T:
-- Construct the official base schedule with T-2 sample steps.
-- Split the first interval.
-- Split the last interval.
-- Run exactly T model evaluations.
+Scientific purpose:
+UniLumos has mixed results:
+- low compute: BSS improves same-NFE RGB closure;
+- high compute: BSS becomes unstable / negative;
+- matched-quality saving is not reached.
 
-Examples:
-- bss10 = base8 + split first/last
-- bss16 = base14 + split first/last
-- bss20 = base18 + split first/last
-- bss24 = base22 + split first/last
+We want to formalize this as a PC-SMO / official-protocol policy certificate:
+1. determine whether BSS is supported at low compute;
+2. determine whether BSS should be rejected at high compute;
+3. select among static deployment policies:
+   - never use BSS;
+   - use BSS only at low NFE;
+   - use BSS at low/mid NFE;
+   - use BSS at all tested NFE;
+4. quantify confidence using finite-sample statistics.
 
-BSS-T is NOT uniform T.
-BSS is teacher-free at inference.
-Reference output is used only for metrics.
+Important:
+UniLumos repo is separate from Relit-LiVE repo. Do not read or modify Relit-LiVE files.
+Do not train anything.
+Do not overwrite previous outputs.
+Do not rerun the full official demo benchmark unless data is missing.
+Prefer analysis-only scripts.
 
-Reference:
-For UniLumos, treat `reference_uniform25` with `sample_steps=25` and `sample_shift=8.0` as the official-default reference unless local official code shows a different default.
-Do not use uniform50 as the main official reference unless explicitly instructed. If uniform50 is run, mark it as extended high-step reference.
+Existing UniLumos result folder to search:
+- `/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
+- `/content/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
+- `/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1/`
 
-Main comparison:
-- Same-compute quality: BSS vs uniform at the same actual NFE.
-- Same-quality compute saving: how many fewer NFEs BSS needs than uniform to reach the same `rgb_l1_closure`.
+Expected completed result:
+- 20 official demo cases
+- mode = abc
+- reference = reference_uniform25
+- 240/240 rows done
+- schedule JSONs valid
+- Table 1 support-aware same-compute result:
+  - low/40%: 0.347 / +0.226
+  - 60%: 0.358 / +0.073
+  - 80%: 0.296 / -0.083
+  - mean_rgb_delta ≈ +0.072
+  - win_rate ≈ 0.642
+- matched-quality thresholds 50/70/80%: BSS not reached
 
-====================================================================
-PHASE 0 — Audit official demo scenarios
-====================================================================
+Create a new analysis output folder:
+
+`bss_experiments/unilumos_policy_certificate_v1/`
+
+with:
+- `reports/`
+- `tables/`
+- `figures/`
+- `scripts/`
+- `splits/`
+- `metrics/`
+
+If running in Colab and Drive is mounted, mirror or copy results to:
+`/content/drive/MyDrive/Colab_Projects/UniLumos-Policy-Cert/unilumos_policy_certificate_v1/`
+
+============================================================
+PHASE 0 — Audit available UniLumos result artifacts
+============================================================
 
 Create:
 
-`bss_experiments/unilumos/reports/00_official_demo_audit.md`
+`bss_experiments/unilumos_policy_certificate_v1/reports/00_artifact_audit.md`
 
-Audit and report:
-- current path
+Report:
+- repo path
 - git remote
 - branch
 - commit hash
 - dirty status
 - Python version
-- GPU info if available
-- whether running locally or in Colab
-- whether Google Drive is mounted
+- whether running in Colab
+- paths found for UniLumos result folders
+- which metrics/tables/manifests exist
+- number of cases found
+- available methods
+- available NFE points
+- selected mode
+- reference method and NFE
+- schedule validity status
 
-Find official UniLumos demo sources:
-- `run_infer.sh`
-- `unilumos_infer_abc.py`
-- `unilumos_infer_ab.py`
-- `unilumos_infer_ac.py`
-- `unilumos_infer_a.py`
-- `unilumos_infer_image.py`
-- `examples/`
-- any official json/csv/txt manifest that enumerates demo cases
-- any scripts that loop over official examples
-
-Search code for:
-- `sample_steps`
-- `sample_shift`
-- `set_random_seed`
-- `manual_seed`
-- `RFLOW_WANX21_T2V`
-- `get_sampling_sigmas`
-- `retrieve_timesteps`
-- `sigmas`
-- `timesteps`
-- `scheduler.sample`
-- `save_dir`
-- `examples`
-
-Define “official demo scenario” as:
-A complete input configuration directly provided or invoked by the official repo. It may include prompt/caption, foreground video, background video, input image, or other conditioning, but it must be specified by official files/scripts.
-
-Do NOT create new cross-scene combinations.
-
-Deliverable table:
-
-| scenario_id | mode | official source | prompt/caption | foreground/input | background/condition | output default | notes |
-
-Also report:
-- number of official scenarios per mode
-- selected main mode
-- why selected mode is closest to Relit-LiVE official protocol
-
-If required examples or weights are missing, stop after this audit and report exactly what is missing.
-
-====================================================================
-PHASE 1 — Confirm/patch schedule control
-====================================================================
-
-Expose schedule control while preserving official uniform behavior.
-
-Patch minimally:
-- expose `--sample_steps`
-- expose `--sample_shift`
-- expose `--seed`
-- expose `--sampler_mode` with choices: `uniform`, `bss`
-- expose `--base_sample_steps`
-- expose `--split_pairs`, default `0,-1`
-- expose `--dump_schedule_json`
-- expose `--case_id` or equivalent scenario selector if possible
-- expose `--output_path` / `--output_dir`
-
-Uniform path:
-- Must remain official when `sampler_mode=uniform`.
-
-BSS path:
-1. Generate official base shifted sigmas using `base_sample_steps` and `sample_shift`.
-2. Insert midpoint between first two sigmas.
-3. Insert midpoint between last sigma and terminal zero.
-4. Pass final sigmas to the same scheduler mechanism used by official inference.
-5. Run exactly actual NFE model evaluations.
-6. Dump schedule JSON.
-
-Schedule JSON must include:
-- model_name = UniLumos
-- mode
-- scenario_id
-- method
-- sampler_mode
-- reference_method
-- sample_steps
-- sample_shift
-- base_sample_steps
-- actual_nfe
-- split_pairs
-- terminal_coord
-- base_sigmas
-- final_sigmas
-- inserted_midpoints
-- seed
-- git_commit
-- dirty status
-- output path
-- timestamp
-
-Validation:
-- uniform8 has 8 model evaluations
-- uniform10 has 10 model evaluations
-- bss10 has 10 model evaluations
-- reference_uniform25 has 25 model evaluations
-- bss10 = base8 + split first/last
-- bss10 != uniform10
-- uniform path remains official
-
-Save patch:
-
-`bss_experiments/unilumos/patches/unilumos_bss_schedule.patch`
-
-====================================================================
-PHASE 2 — Create experiment folder
-====================================================================
-
-Create:
-
-`/content/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
-
-If not in Colab, fallback:
-
-`./bss_runs/model_b_unilumos_official_all_demos_bss_v1/`
-
-If Drive is mounted:
-
-`/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
-
-Inside:
-- `manifests/`
-- `logs/`
-- `outputs/`
-- `outputs/uniform/`
-- `outputs/bss/`
-- `outputs/reference/`
-- `schedules/`
-- `metrics/`
-- `tables/`
-- `figures/`
-- `figures/side_by_side/`
-- `reports/`
-- `scripts/`
-
-====================================================================
-PHASE 3 — Build official demo manifest
-====================================================================
-
-Create:
-
-`bss_experiments/unilumos/scripts/make_manifest_unilumos_official_all_demos.py`
-
-It should enumerate all official demo scenarios for the selected main mode only.
-
-Default mode priority:
-1. `abc`
-2. `ab`
-3. `ac`
-4. `a`
-5. `image`
-
-Do not cross-combine scenarios. Use official-provided scenario rows only.
-
-Methods to include:
-
-Core:
-- uniform8
-- uniform10
-- bss10
-- reference_uniform25
-
-Quality ladder:
+Expected methods:
 - uniform8
 - uniform10
 - uniform12
 - uniform16
 - uniform20
 - uniform24
-- reference_uniform25
 - bss10
 - bss12
 - bss16
 - bss20
 - bss24
-
-Do not include bss30 in the official-default main table because reference is uniform25. Only include bss30 if an extended uniform50 reference is explicitly enabled.
-
-Manifest fields:
-- run_id
-- model_id = UniLumos
-- model_family = flow_transformer_relighting
-- modality = video or image
-- task = relighting
-- protocol = official_demos
-- mode = abc/ab/ac/a/image
-- scenario_id
-- official_source_file
-- prompt_or_caption
-- foreground_path
-- background_path
-- input_image_path
-- conditioning_paths
-- method
-- method_family = uniform/bss/reference
-- sampler_mode
-- sample_steps
-- base_sample_steps
-- actual_nfe
-- sample_shift
-- split_pairs
-- reference_method = reference_uniform25
-- reference_nfe = 25
-- low_baseline_method = uniform8
-- low_baseline_nfe = 8
-- seed
-- output_path
-- schedule_json_path
-- stdout_log_path
-- stderr_log_path
-- runtime_json_path
-- status
-- error_message
-- git_commit
-- dirty_status
-
-Write:
-- `manifests/unilumos_official_all_demos_manifest.csv`
-- `manifests/unilumos_official_all_demos_manifest.jsonl`
-
-Also create a small smoke manifest:
-- first official scenario only
-- uniform8 / uniform10 / bss10 / reference_uniform25
-
-Write:
-- `manifests/unilumos_official_smoke_manifest.csv`
-
-====================================================================
-PHASE 4 — Run smoke first
-====================================================================
-
-Run only the first official scenario:
-- uniform8
-- uniform10
-- bss10
 - reference_uniform25
 
-Do not run all demos until smoke passes.
+If per-case metrics are missing, reconstruct from available metrics if possible. If not possible, stop and report exactly what is missing.
 
-After smoke, validate:
-- outputs exist
-- schedule JSONs exist
-- NFE counts are correct
-- bss10 schedule is valid
-- same seed/conditioning
-- metrics can be computed
+============================================================
+PHASE 1 — Define certification quantities
+============================================================
 
-Write:
+Implement:
 
-`reports/01_smoke_report.md`
+`bss_experiments/unilumos_policy_certificate_v1/scripts/certification_utils.py`
 
-If smoke fails, stop.
+Definitions:
 
-====================================================================
-PHASE 5 — Run all official demo scenarios
-====================================================================
+For each case \(c\), NFE \(T\), and metric `rgb_l1_closure`:
 
-After smoke passes, run all official demo scenarios in the selected mode.
+Same-compute paired gain:
+`g_T(c) = Q_BSS_T(c) - Q_uniform_T(c)`
 
-Use resume support.
-Run one row at a time.
-Never overwrite completed rows unless `--force`.
-Sync to Drive after each completed run if Drive is mounted.
-
-Write:
-
-`reports/02_full_official_demos_run_report.md`
-
-Include:
-- selected mode
-- number of official scenarios
-- total rows planned
-- completed rows
-- failed rows
-- invalid schedule rows
-- total runtime
-- per-method runtime
-- failures and errors
-
-====================================================================
-PHASE 6 — Metrics
-====================================================================
-
-Create/update:
-
-`bss_experiments/unilumos/scripts/compute_metrics_against_ref.py`
-
-For each scenario:
+where:
+- `Q` = rgb_l1_closure
+- uniform and BSS must have same actual NFE T
 - reference = reference_uniform25
 - low baseline = uniform8
-- compute RGB L1 to reference
-- compute RGB L2 to reference
-- compute PSNR to reference
-- compute temporal_diff_l1
-- compute temporal_diff_l1_to_ref
-- compute rgb_l1_closure:
 
-`closure = 1 - d(method, reference) / d(uniform8, reference)`
+Also compute gains for temporal closure if available.
 
-- compute temporal closure similarly
-- runtime seconds
-- actual NFE
-- compute_fraction = actual_nfe / reference_nfe
+For each NFE T:
+- mean gain
+- SEM
+- bootstrap 95% CI
+- one-sided sign-test p-value for H0: win probability <= 0.5
+- win count / total
+- Clopper-Pearson lower bound for win probability
+- Hoeffding lower confidence bound for expected gain
 
-For image mode, temporal metrics should be NA.
+For Hoeffding:
+Compute raw empirical summaries and clipped gain certificate with gains clipped to [-1, 1].
+Use delta:
+- 0.10
+- 0.05
+- 0.01
+
+============================================================
+PHASE 2 — Same-compute statistical certificate
+============================================================
+
+Create:
+
+`bss_experiments/unilumos_policy_certificate_v1/scripts/make_same_compute_certificate.py`
+
+For each tested actual NFE T where both uniformT and bssT exist:
+- compute paired gains
+- bootstrap CI
+- sign-test p-value
+- win probability lower bound
+- Hoeffding LCB
+- green/yellow/red verdict
+
+Verdict rule:
+- Green:
+  - mean gain > 0
+  - bootstrap CI lower > 0 OR sign-test p < 0.05
+  - win rate >= 0.75
+- Yellow:
+  - mean gain > 0 but uncertainty overlaps zero or win rate < 0.75
+- Red:
+  - mean gain <= 0
 
 Write:
-- `metrics/master_long_metrics.csv`
-- `metrics/per_case_metrics.csv`
-- `metrics/metrics_against_ref.csv`
+- `tables/tableA_same_compute_certificate.csv`
+- `tables/tableA_same_compute_certificate.md`
 
-Master long format fields:
+Columns:
 - model_id
-- model_family
-- modality
-- task
 - protocol
 - mode
-- scenario_id
-- method
-- method_family
-- actual_nfe
+- reference_method
 - reference_nfe
+- metric
+- actual_nfe
 - compute_fraction
-- metric_name
-- raw_distance
-- closure
-- runtime_sec
-- schedule_valid
-- status
+- cases
+- mean_gain
+- sem_gain
+- bootstrap_ci_low
+- bootstrap_ci_high
+- win_count
+- total_count
+- win_rate
+- sign_test_p_value
+- clopper_pearson_winprob_lcb_95
+- hoeffding_lcb_delta_0.10
+- hoeffding_lcb_delta_0.05
+- hoeffding_lcb_delta_0.01
+- verdict
 
-====================================================================
-PHASE 7 — Generate support-aware cross-model tables
-====================================================================
+Write:
+`reports/01_same_compute_certificate.md`
+
+Expected interpretation:
+- BSS should likely be yellow/green at low compute, especially T=10.
+- BSS should likely be red or weak at high compute, especially T=20/24.
+- Do not force a global positive conclusion.
+
+============================================================
+PHASE 3 — Deployment policy selection
+============================================================
+
+We want PC-SMO/official evaluation to choose a deployment policy, not just evaluate BSS blindly.
+
+Candidate deployment policies:
+
+1. `never_bss`
+   - use uniform at every tested NFE
+
+2. `bss_all`
+   - use BSS at every tested NFE where BSS exists
+
+3. `bss_low_only`
+   - use BSS at the lowest valid same-compute point only
+   - likely T=10
+
+4. `bss_low_mid`
+   - use BSS at T <= 16, uniform above
+
+5. `bss_until_positive_calibration`
+   - on calibration set, use BSS at NFE T only if calibration mean gain at T > 0; otherwise use uniform
+
+6. `oracle_per_nfe_calibration`
+   - choose BSS or uniform per NFE based on which has higher calibration mean closure
+
+For each policy \(\pi\), define per-case score:
+`score(c, pi) = mean over tested compute points of rgb_l1_closure(c, method chosen by pi at that NFE)`
+
+Tested compute points should include:
+- T=10
+- T=16 if available
+- T=20 if available
+- T=24 if available
+
+Do not include target 20% fallback in aggregate score unless explicitly configured.
+Use actual tested NFE points.
+
+For each policy:
+- compute calibration score
+- holdout score
+- full score
+- rank
+
+Finite-policy uniform convergence:
+Let M = number of candidate policies.
+If scores are clipped to [0,1]:
+`epsilon = sqrt(log(2*M/delta)/(2*n_calib))`
+
+Regret bound:
+`F(pi_star) - F(pi_hat) <= 2*epsilon`
+
+Write:
+- `tables/tableB_deployment_policy_selection.csv`
+- `tables/tableB_deployment_policy_selection.md`
+
+Columns:
+- candidate_policy
+- calibration_score
+- holdout_score
+- full_score
+- rank_calibration
+- rank_holdout
+- rank_full
+- selected_by_calibration
+- regret_epsilon_delta_0.10
+- regret_epsilon_delta_0.05
+- bss_all_certified_best_delta_0.05
+- notes
+
+Expected useful outcome:
+- `bss_low_only` or `bss_until_positive_calibration` may beat `bss_all`.
+- This would support the claim:
+  “UniLumos should use BSS only in low-compute regime; high-NFE BSS should be rejected.”
+
+============================================================
+PHASE 4 — Calibration / holdout splits
+============================================================
+
+Create split files under:
+`bss_experiments/unilumos_policy_certificate_v1/splits/`
+
+Use deterministic splits based on available scenario IDs.
+
+Splits:
+1. First-half / second-half:
+   - calibration = first 10 scenarios sorted by scenario_id
+   - holdout = last 10 scenarios
+2. Alternating split:
+   - calibration if scenario_index % 2 == 0
+   - holdout otherwise
+3. Foreground/background split if scenario IDs expose foreground/background:
+   - calibration on half foregrounds or backgrounds
+   - holdout on the others
+4. Optional random split:
+   - 50/50 with seed 0
+
+For each split:
+- select deployment policy on calibration
+- evaluate selected policy on holdout
+- report whether selected policy is:
+  - never_bss
+  - bss_low_only
+  - bss_low_mid
+  - bss_all
+  - oracle_per_nfe_calibration
+
+Write:
+- `tables/tableC_calibration_holdout_policy_selection.csv`
+- `tables/tableC_calibration_holdout_policy_selection.md`
+- `reports/02_calibration_holdout_summary.md`
+
+Key question:
+Can a calibration set discover that UniLumos should not use BSS at high NFE?
+
+============================================================
+PHASE 5 — Threshold / matched-quality certificate
+============================================================
+
+Read existing matched-quality table if available, or recompute.
+
+For RGB-L1 closure thresholds:
+- 0.50
+- 0.70
+- 0.80
+
+Report whether:
+- uniform reaches threshold
+- BSS reaches threshold
+- BSS reaches threshold at lower NFE than uniform
+- BSS not reached
+
+Write:
+- `tables/tableD_matched_quality_certificate.csv`
+- `tables/tableD_matched_quality_certificate.md`
+
+Expected:
+- BSS not reached for 50/70/80 on UniLumos.
+- Report this honestly.
+
+============================================================
+PHASE 6 — Final UniLumos policy certificate report
+============================================================
 
 Create:
 
-`bss_experiments/unilumos/scripts/make_cross_model_tables.py`
-
-Important:
-The cross-model table uses official compute fractions:
-
-`c ∈ {0.2, 0.4, 0.6, 0.8}`
-
-But do NOT leave empty cells in the main table.
-Also do NOT extrapolate below the tested support.
-
-Use support-aware reporting.
-
-Support tags:
-- `E`: exact target compute fraction tested.
-- `I`: interpolated within tested range.
-- `F`: floor. Target fraction is below the minimum valid tested NFE; report the lowest valid tested point and tag actual fraction.
-- `N`: nearest tested point, only if interpolation is not appropriate but target is within support.
-- `C`: ceiling. Target fraction above max tested range; only use if explicitly allowed.
-- `OOS`: out of support. Avoid in main table unless no numeric value can be responsibly shown.
-
-Default rule:
-1. target_nfe = c * reference_nfe.
-2. Find same-NFE pairs where both uniformT and bssT exist.
-3. If exact actual NFE exists, use it and tag `E`.
-4. Else if target lies inside tested range, interpolate and tag `I`.
-5. Else if target is below min tested NFE, use min tested NFE, tag `F@actual_compute`.
-6. Else if target is above max tested NFE, use max tested NFE only if allowed, tag `C@actual_compute`; otherwise mark OOS.
-7. Do not use extrapolation in the main table.
-8. Do not include `F`, `C`, or `OOS` points in Mean Δ or ΔAUC unless explicitly configured with `include_support_points=True`.
-
-Cell display format:
-
-`BSS_closure / +delta [TAG@actual%]`
-
-Example:
-
-`0.365 / +0.250 [E@40%]`
-
-If target is 20% but lowest valid point is 40%:
-
-`0.365 / +0.250 [F@40%]`
-
-This means: 20% target is below support; we report the lowest valid operating point, which is 40% official compute.
-
-------------------------------------------------------------
-Table 1A: Main same-compute quality table
-------------------------------------------------------------
-
-File:
-- `tables/table1a_same_compute_rgb_closure_main.csv`
-- `tables/table1a_same_compute_rgb_closure_main.md`
-
-One row for UniLumos.
-
-Use columns:
-- model_id
-- modality
-- task
-- protocol
-- mode
-- reference_method
-- reference_nfe
-- cases
-- rgb_at_low
-- rgb_at_40pct
-- rgb_at_60pct
-- rgb_at_80pct
-- mean_rgb_delta
-- rgb_delta_auc
-- rgb_win_rate_same_compute
-- status
-- notes
-
-Definition:
-- `rgb_at_low` = lowest valid BSS operating point, with actual compute shown.
-- `rgb_at_40pct`, `rgb_at_60pct`, `rgb_at_80pct` = support-aware target columns.
-- Do not include `rgb_at_low` in mean/auc if it duplicates another support-aware target.
-
-This is the preferred main-paper row because it avoids an awkward empty 20% column for models whose official reference NFE is small.
-
-------------------------------------------------------------
-Table 1B: Strict support-aware official fractions table
-------------------------------------------------------------
-
-File:
-- `tables/table1b_same_compute_rgb_closure_support_aware.csv`
-- `tables/table1b_same_compute_rgb_closure_support_aware.md`
-
-One row for UniLumos.
-
-Use columns:
-- model_id
-- modality
-- task
-- protocol
-- mode
-- reference_method
-- reference_nfe
-- cases
-- rgb_at_20pct
-- rgb_at_40pct
-- rgb_at_60pct
-- rgb_at_80pct
-- mean_rgb_delta
-- rgb_delta_auc
-- rgb_win_rate_same_compute
-- status
-- notes
-
-Each cell must include support tag, e.g.:
-- `0.365 / +0.250 [F@40%]`
-- `0.365 / +0.250 [E@40%]`
-- `0.512 / +0.180 [I@60%]`
-
-Also write full detailed CSV:
-- `tables/table1_same_compute_rgb_closure_detailed.csv`
-
-Detailed fields:
-- target_compute_fraction
-- target_nfe
-- actual_nfe_used
-- actual_compute_fraction
-- support_mode
-- include_in_mean_auc
-- uniform_method
-- bss_method
-- uniform_rgb_l1_closure
-- bss_rgb_l1_closure
-- delta_rgb_l1_closure
-- win_rate_rgb
-- sem_uniform
-- sem_bss
-- sem_delta
-- display_cell
-- status
-
-------------------------------------------------------------
-Table 2: Matched-quality compute saving
-------------------------------------------------------------
-
-File:
-- `tables/table2_matched_quality_compute_saving.csv`
-- `tables/table2_matched_quality_compute_saving.md`
-
-One row for UniLumos.
-
-Thresholds:
-- RGB closure 0.50
-- RGB closure 0.70
-- RGB closure 0.80
-
-For each threshold estimate:
-- uniform NFE to reach threshold
-- BSS NFE to reach threshold
-- NFE saved = uniform_nfe - bss_nfe
-- compute saved % = (uniform_nfe - bss_nfe) / uniform_nfe
-
-Use monotone-envelope interpolation because quality curves may be non-monotonic.
-If threshold not reached by either curve, report `not reached`.
-If only one curve reaches, report carefully.
-
-Columns:
-- model_id
-- reference_nfe
-- cases
-- save_at_rgb50
-- save_at_rgb70
-- save_at_rgb80
-- best_tested_saving_pct
-- status
-- notes
-
-Cell format:
-- `X.XX NFE / YY.Y%`
-- or `not reached`
-
-Also write detailed:
-- `tables/table2_matched_quality_compute_saving_detailed.csv`
-
-------------------------------------------------------------
-Table 3: Same-NFE main table
-------------------------------------------------------------
-
-File:
-- `tables/table3_same_nfe_main.csv`
-- `tables/table3_same_nfe_main.md`
-
-Rows:
-- uniform8
-- uniform10
-- bss10
-- reference_uniform25
-- optional ladder rows
-
-Columns:
-- Method
-- NFE
-- completed_cases
-- RGB L1 mean ± SEM
-- RGB L2 mean ± SEM
-- PSNR mean ± SEM
-- Temporal ref-error mean ± SEM
-- RGB closure mean ± SEM
-- Temporal closure mean ± SEM
-- Runtime seconds mean ± SEM
-- Win rate vs uniform same NFE
-
-------------------------------------------------------------
-Table 4: Failure / smallest gain cases
-------------------------------------------------------------
-
-File:
-- `tables/table4_failure_or_smallest_gain_cases.csv`
-- `tables/table4_failure_or_smallest_gain_cases.md`
-
-List:
-- cases where BSS loses to uniform at same NFE on RGB closure
-- cases where gain is smallest
-- cases where temporal worsens
-- top 5 gains
-- bottom 5 gains
-
-Fields:
-- scenario_id
-- method
-- actual_nfe
-- uniform_rgb_closure
-- bss_rgb_closure
-- delta_rgb_closure
-- uniform_temporal_closure
-- bss_temporal_closure
-- delta_temporal_closure
-- side_by_side_path
-
-------------------------------------------------------------
-Table 5: Cross-model summary row
-------------------------------------------------------------
-
-File:
-- `tables/cross_model_summary_row.csv`
-- `tables/cross_model_summary_row.md`
-
-This is the row we will later concatenate with Relit-LiVE and other models.
-
-Columns:
-- model_id
-- model_family
-- modality
-- task
-- protocol
-- mode
-- reference_method
-- reference_nfe
-- cases
-- status
-- rgb_at_low
-- rgb_at_20pct
-- rgb_at_40pct
-- rgb_at_60pct
-- rgb_at_80pct
-- mean_rgb_delta
-- rgb_delta_auc
-- rgb_win_rate_same_compute
-- rgb_save_at_50pct
-- rgb_save_at_70pct
-- rgb_save_at_80pct
-- best_tested_rgb_saving_pct
-- notes
-
-Cell format:
-- `BSS closure / +delta [TAG@actual%]`
-
-====================================================================
-PHASE 8 — Figures
-====================================================================
-
-Generate:
-- `figures/compute_quality_rgb_closure.pdf`
-- `figures/compute_quality_rgb_closure.png`
-
-Plot:
-- x-axis: official compute fraction = NFE / reference_nfe
-- y-axis: rgb_l1_closure
-- uniform curve
-- BSS curve
-- mean over official scenarios
-- SEM shading if multiple scenarios
-
-Generate side-by-side:
-- `figures/side_by_side/index.html`
-
-Panels:
-- uniform8 | uniform10 | bss10 | reference25
-- uniform10 | bss10 | uniform20 | bss20 | reference25, if ladder exists
-
-====================================================================
-PHASE 9 — Final report
-====================================================================
-
-Create:
-
-`reports/FINAL_UNILUMOS_OFFICIAL_DEMOS_BSS_REPORT.md`
+`bss_experiments/unilumos_policy_certificate_v1/reports/FINAL_UNILUMOS_POLICY_CERTIFICATE_REPORT.md`
 
 Include:
 1. Purpose
-2. Relation to Relit-LiVE protocol
-3. Official demo scenario audit
-4. Selected mode and number of official scenarios
-5. Schedule implementation summary
-6. Schedule validation result
-7. Full run status
-8. Table 1A: main same-compute RGB closure
-9. Table 1B: strict support-aware official fraction table
-10. Table 2: matched-quality compute saving
-11. Table 3: same-NFE main table
-12. Failure/smallest-gain analysis
-13. Compute-quality curve path
-14. Side-by-side paths
-15. Recommendation:
-    - ready to add UniLumos to cross-model table,
-    - or need more cases/modes,
-    - or fix failures first.
+2. Available artifact audit
+3. Same-compute statistical certificate
+4. Deployment policy selection
+5. Calibration/holdout results
+6. Matched-quality certificate
+7. Final verdict:
+   - Green / Yellow / Red for BSS-all
+   - Green / Yellow / Red for BSS-low-only
+8. Interpretation:
+   - UniLumos shows low-compute BSS benefit;
+   - BSS-all should not be deployed;
+   - matched-quality compute saving is not certified;
+   - PC-SMO/official diagnostics prevent overclaiming and can reject bad schedules.
+9. Caveats:
+   - official demos only
+   - reference_uniform25
+   - NFE as compute proxy
+   - no universal conclusion
+10. Recommended next experiment:
+   - solver-coordinate ablation
+   - sample_shift ablation
+   - Model C
 
-Use cautious wording:
-- “UniLumos official-demo protocol”
-- “same-NFE BSS vs uniform”
-- “reference-normalized RGB-L1 closure”
-- “official-default uniform25 reference”
-- “support-aware reporting”
-- “BSS shifts the quality-compute curve if supported”
+Suggested wording if results match current observations:
+“UniLumos receives a Yellow certificate: BSS improves low-compute same-NFE quality, but BSS-all is not supported and matched-quality NFE saving is not certified. The selected deployment policy is likely low-only or calibration-dependent.”
 
-Do not write:
-- “universal generalization”
-- “BSS is guaranteed optimal”
-- “official quality reached”
-unless threshold tables support it.
-
-====================================================================
-PHASE 10 — Final response
-====================================================================
-
-When done, report:
-- manifest path
-- metrics path
-- table1A path
-- table1B path
-- table2 path
-- cross_model_summary_row path
+Final response should include:
+- artifact audit path
+- same-compute certificate table path
+- deployment policy table path
+- calibration/holdout table path
+- matched-quality certificate table path
 - final report path
-- selected mode
-- number of official scenarios
-- completed/failed rows
-- invalid schedules
-- whether BSS beats uniform at same compute
-- whether matched-quality NFE saving is supported
-- exact next recommended experiment
+- verdict for BSS-all
+- verdict for low-only BSS
+- selected policy
+- any missing data or limitations
 
 Do not push unless asked.
