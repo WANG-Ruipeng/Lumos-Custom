@@ -1,397 +1,364 @@
 You are working inside our UniLumos BSS fork.
 
 Goal:
-Run an offline policy-certification analysis for the completed UniLumos official-demo BSS experiments.
+Run a calibration-to-holdout BSS Deployment Score (BDS) analysis on the existing UniLumos official-demo results.
 
-This is NOT a new full model run unless required data is missing.
-This task should mostly read existing UniLumos metrics/manifests/tables and produce statistical certification reports.
+This should be analysis-only if existing metrics are available.
+Do NOT rerun the full UniLumos benchmark unless required files are missing.
+Do NOT train anything.
+Do NOT change model weights.
+Do NOT overwrite existing outputs.
 
 Scientific purpose:
-UniLumos has mixed results:
-- low compute: BSS improves same-NFE RGB closure;
-- high compute: BSS becomes unstable / negative;
+UniLumos currently shows mixed behavior:
+- low compute BSS is positive;
+- high compute BSS can be negative;
 - matched-quality saving is not reached.
 
-We want to formalize this as a PC-SMO / official-protocol policy certificate:
-1. determine whether BSS is supported at low compute;
-2. determine whether BSS should be rejected at high compute;
-3. select among static deployment policies:
-   - never use BSS;
-   - use BSS only at low NFE;
-   - use BSS at low/mid NFE;
-   - use BSS at all tested NFE;
-4. quantify confidence using finite-sample statistics.
+We want to test whether a small calibration subset can predict this:
+- BDS_low should be positive if low-NFE BSS is useful.
+- BDS_all may be non-positive if BSS should not be deployed across all NFE.
+- The predicted verdict should likely be Low-only / Mixed.
 
-Important:
-UniLumos repo is separate from Relit-LiVE repo. Do not read or modify Relit-LiVE files.
-Do not train anything.
-Do not overwrite previous outputs.
-Do not rerun the full official demo benchmark unless data is missing.
-Prefer analysis-only scripts.
+This makes BSS deployment non-post-hoc:
+calibration official demos -> BDS -> predicted deployment -> holdout verification.
 
-Existing UniLumos result folder to search:
-- `/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
-- `/content/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/`
-- `/content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1/`
+Core score:
+Use RGB-L1 closure.
 
-Expected completed result:
-- 20 official demo cases
-- mode = abc
-- reference = reference_uniform25
-- 240/240 rows done
-- schedule JSONs valid
-- Table 1 support-aware same-compute result:
-  - low/40%: 0.347 / +0.226
-  - 60%: 0.358 / +0.073
-  - 80%: 0.296 / -0.083
-  - mean_rgb_delta ≈ +0.072
-  - win_rate ≈ 0.642
-- matched-quality thresholds 50/70/80%: BSS not reached
+For each case c and NFE T:
 
-Create a new analysis output folder:
+gain(c, T) =
+    rgb_l1_closure_bss(c, T) - rgb_l1_closure_uniform(c, T)
 
-`bss_experiments/unilumos_policy_certificate_v1/`
+Reference:
+- reference_uniform25
+- reference_nfe = 25
+- low baseline = uniform8
 
-with:
-- `reports/`
-- `tables/`
-- `figures/`
-- `scripts/`
-- `splits/`
-- `metrics/`
+Compute ranges:
+- BDS_low: Tset = {10}
+- BDS_all: Tset = all supported same-compute pairs, likely {10,16,20,24}
+Use exact tested NFE pairs only.
+Do not interpolate for BDS.
 
-If running in Colab and Drive is mounted, mirror or copy results to:
-`/content/drive/MyDrive/Colab_Projects/UniLumos-Policy-Cert/unilumos_policy_certificate_v1/`
+Existing UniLumos result folders to search:
+- /content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/
+- /content/UniLumos-BSS-Runs/model_b_unilumos_official_all_demos_bss_v1/
+- /content/drive/MyDrive/Colab_Projects/UniLumos-BSS-Runs/model_b_unilumos_official_bss_smoke_v1/
+
+Expected existing files:
+- metrics/master_long_metrics.csv
+- metrics/metrics_against_ref.csv
+- metrics/per_case_metrics.csv
+- tables/table1a_same_compute_rgb_closure_main.csv
+- tables/table1b_same_compute_rgb_closure_support_aware.csv
+- tables/table2_matched_quality_compute_saving.csv
+- tables/table3_same_nfe_main.csv
+- tables/table4_failure_or_smallest_gain_cases.csv
+- tables/cross_model_summary_row.csv
+- manifests/*.csv
+
+Create output folder:
+bss_experiments/unilumos_bds_certificate_v1/
+
+Inside:
+- reports/
+- tables/
+- figures/
+- scripts/
+- splits/
+- metrics/
+
+If running in Colab and Drive is mounted, mirror to:
+/content/drive/MyDrive/Colab_Projects/UniLumos-BDS/unilumos_bds_certificate_v1/
 
 ============================================================
-PHASE 0 — Audit available UniLumos result artifacts
+PHASE 0 — Artifact audit
 ============================================================
 
 Create:
-
-`bss_experiments/unilumos_policy_certificate_v1/reports/00_artifact_audit.md`
+bss_experiments/unilumos_bds_certificate_v1/reports/00_artifact_audit.md
 
 Report:
 - repo path
 - git remote
-- branch
+- current branch
 - commit hash
 - dirty status
 - Python version
 - whether running in Colab
-- paths found for UniLumos result folders
-- which metrics/tables/manifests exist
-- number of cases found
-- available methods
-- available NFE points
-- selected mode
-- reference method and NFE
-- schedule validity status
+- found result folders
+- found metrics/tables/manifests
+- number of official demo cases
+- scenario ids
+- mode, likely abc
+- reference method, likely reference_uniform25
+- reference NFE
+- methods found
+- NFE points found
+- whether uniformT and bssT pairs exist
+- whether RGB-L1 closure is available per case
+- schedule validity status if available
 
-Expected methods:
-- uniform8
-- uniform10
-- uniform12
-- uniform16
-- uniform20
-- uniform24
-- bss10
-- bss12
-- bss16
-- bss20
-- bss24
+Expected result:
+- 20 official demo cases
+- 240/240 rows complete
 - reference_uniform25
+- schedule JSONs valid
 
-If per-case metrics are missing, reconstruct from available metrics if possible. If not possible, stop and report exactly what is missing.
-
-============================================================
-PHASE 1 — Define certification quantities
-============================================================
-
-Implement:
-
-`bss_experiments/unilumos_policy_certificate_v1/scripts/certification_utils.py`
-
-Definitions:
-
-For each case \(c\), NFE \(T\), and metric `rgb_l1_closure`:
-
-Same-compute paired gain:
-`g_T(c) = Q_BSS_T(c) - Q_uniform_T(c)`
-
-where:
-- `Q` = rgb_l1_closure
-- uniform and BSS must have same actual NFE T
-- reference = reference_uniform25
-- low baseline = uniform8
-
-Also compute gains for temporal closure if available.
-
-For each NFE T:
-- mean gain
-- SEM
-- bootstrap 95% CI
-- one-sided sign-test p-value for H0: win probability <= 0.5
-- win count / total
-- Clopper-Pearson lower bound for win probability
-- Hoeffding lower confidence bound for expected gain
-
-For Hoeffding:
-Compute raw empirical summaries and clipped gain certificate with gains clipped to [-1, 1].
-Use delta:
-- 0.10
-- 0.05
-- 0.01
+If per-case RGB-L1 closure is missing, reconstruct it from metrics if possible.
+If impossible, stop and report exactly what is missing.
 
 ============================================================
-PHASE 2 — Same-compute statistical certificate
+PHASE 1 — Build same-compute gain table
 ============================================================
 
-Create:
+Create script:
+bss_experiments/unilumos_bds_certificate_v1/scripts/build_same_compute_gain_table.py
 
-`bss_experiments/unilumos_policy_certificate_v1/scripts/make_same_compute_certificate.py`
+Output:
+metrics/unilumos_same_compute_gain_long.csv
 
-For each tested actual NFE T where both uniformT and bssT exist:
-- compute paired gains
-- bootstrap CI
-- sign-test p-value
-- win probability lower bound
-- Hoeffding LCB
-- green/yellow/red verdict
-
-Verdict rule:
-- Green:
-  - mean gain > 0
-  - bootstrap CI lower > 0 OR sign-test p < 0.05
-  - win rate >= 0.75
-- Yellow:
-  - mean gain > 0 but uncertainty overlaps zero or win rate < 0.75
-- Red:
-  - mean gain <= 0
-
-Write:
-- `tables/tableA_same_compute_certificate.csv`
-- `tables/tableA_same_compute_certificate.md`
-
-Columns:
-- model_id
-- protocol
-- mode
-- reference_method
-- reference_nfe
-- metric
+Each row:
+- model_id = UniLumos
+- protocol = official_demos
+- mode = abc
+- reference_method = reference_uniform25
+- reference_nfe = 25
+- scenario_id
+- case_id
 - actual_nfe
-- compute_fraction
-- cases
-- mean_gain
-- sem_gain
-- bootstrap_ci_low
-- bootstrap_ci_high
-- win_count
-- total_count
-- win_rate
-- sign_test_p_value
-- clopper_pearson_winprob_lcb_95
-- hoeffding_lcb_delta_0.10
-- hoeffding_lcb_delta_0.05
-- hoeffding_lcb_delta_0.01
-- verdict
+- compute_fraction = actual_nfe / 25
+- uniform_method
+- bss_method
+- uniform_rgb_l1_closure
+- bss_rgb_l1_closure
+- gain_rgb_l1_closure
+- bss_win = gain_rgb_l1_closure > 0
+- schedule_valid if available
 
-Write:
-`reports/01_same_compute_certificate.md`
+Use exact NFE pairs only:
+- 10
+- 12 if available
+- 16
+- 20
+- 24
 
-Expected interpretation:
-- BSS should likely be yellow/green at low compute, especially T=10.
-- BSS should likely be red or weak at high compute, especially T=20/24.
-- Do not force a global positive conclusion.
+For BDS_low use only NFE 10.
+For BDS_all use {10,16,20,24} if all exist.
+If one point is missing, document and use available points.
 
-============================================================
-PHASE 3 — Deployment policy selection
-============================================================
-
-We want PC-SMO/official evaluation to choose a deployment policy, not just evaluate BSS blindly.
-
-Candidate deployment policies:
-
-1. `never_bss`
-   - use uniform at every tested NFE
-
-2. `bss_all`
-   - use BSS at every tested NFE where BSS exists
-
-3. `bss_low_only`
-   - use BSS at the lowest valid same-compute point only
-   - likely T=10
-
-4. `bss_low_mid`
-   - use BSS at T <= 16, uniform above
-
-5. `bss_until_positive_calibration`
-   - on calibration set, use BSS at NFE T only if calibration mean gain at T > 0; otherwise use uniform
-
-6. `oracle_per_nfe_calibration`
-   - choose BSS or uniform per NFE based on which has higher calibration mean closure
-
-For each policy \(\pi\), define per-case score:
-`score(c, pi) = mean over tested compute points of rgb_l1_closure(c, method chosen by pi at that NFE)`
-
-Tested compute points should include:
-- T=10
-- T=16 if available
-- T=20 if available
-- T=24 if available
-
-Do not include target 20% fallback in aggregate score unless explicitly configured.
-Use actual tested NFE points.
-
-For each policy:
-- compute calibration score
-- holdout score
-- full score
-- rank
-
-Finite-policy uniform convergence:
-Let M = number of candidate policies.
-If scores are clipped to [0,1]:
-`epsilon = sqrt(log(2*M/delta)/(2*n_calib))`
-
-Regret bound:
-`F(pi_star) - F(pi_hat) <= 2*epsilon`
-
-Write:
-- `tables/tableB_deployment_policy_selection.csv`
-- `tables/tableB_deployment_policy_selection.md`
-
-Columns:
-- candidate_policy
-- calibration_score
-- holdout_score
-- full_score
-- rank_calibration
-- rank_holdout
-- rank_full
-- selected_by_calibration
-- regret_epsilon_delta_0.10
-- regret_epsilon_delta_0.05
-- bss_all_certified_best_delta_0.05
-- notes
-
-Expected useful outcome:
-- `bss_low_only` or `bss_until_positive_calibration` may beat `bss_all`.
-- This would support the claim:
-  “UniLumos should use BSS only in low-compute regime; high-NFE BSS should be rejected.”
+Do not use support-aware fallback values like F@40% for BDS.
+Do not interpolate for BDS.
 
 ============================================================
-PHASE 4 — Calibration / holdout splits
+PHASE 2 — Define calibration/holdout splits
 ============================================================
 
 Create split files under:
-`bss_experiments/unilumos_policy_certificate_v1/splits/`
+bss_experiments/unilumos_bds_certificate_v1/splits/
 
-Use deterministic splits based on available scenario IDs.
+Use deterministic splits:
 
-Splits:
-1. First-half / second-half:
+1. first_half_split:
    - calibration = first 10 scenarios sorted by scenario_id
    - holdout = last 10 scenarios
-2. Alternating split:
+
+2. alternating_split:
    - calibration if scenario_index % 2 == 0
    - holdout otherwise
-3. Foreground/background split if scenario IDs expose foreground/background:
-   - calibration on half foregrounds or backgrounds
-   - holdout on the others
-4. Optional random split:
-   - 50/50 with seed 0
+
+3. background_or_group_split:
+   - if scenario ids expose foreground/background groups, split by group
+   - otherwise skip and document why
+
+4. random_split_seed0:
+   - 50/50 cases with random seed 0
+
+Write:
+- splits/first_half_split.csv
+- splits/alternating_split.csv
+- splits/random_split_seed0.csv
+- optional group split file
+
+Each row:
+- case_id
+- scenario_id
+- split_name
+- split = calibration / holdout
+
+============================================================
+PHASE 3 — Compute BDS on calibration and verify on holdout
+============================================================
+
+Create script:
+bss_experiments/unilumos_bds_certificate_v1/scripts/compute_bds.py
 
 For each split:
-- select deployment policy on calibration
-- evaluate selected policy on holdout
-- report whether selected policy is:
-  - never_bss
-  - bss_low_only
-  - bss_low_mid
-  - bss_all
-  - oracle_per_nfe_calibration
+
+Compute BDS_low:
+- Tset = {10}
+- calibration average gain
+- bootstrap 95% lower confidence bound
+- bootstrap 95% CI
+- win rate on calibration
+- Hoeffding LCB with gains clipped to [-1, 1]
+
+Compute BDS_all:
+- Tset = {10,16,20,24} or available exact same-compute points
+- calibration average gain
+- bootstrap 95% lower confidence bound
+- bootstrap 95% CI
+- win rate on calibration
+- Hoeffding LCB
+
+Then evaluate holdout:
+- holdout mean gain for low
+- holdout win rate for low
+- holdout mean gain for all
+- holdout win rate for all
+- whether calibration verdict is confirmed
+
+Bootstrap:
+- use 10,000 resamples if cheap, else 2,000
+- resample cases, not individual NFE rows, to preserve case-level dependence
+
+Hoeffding:
+- clip each case-level averaged gain to [-1, 1]
+- delta = 0.05
+- LCB = mean - 2 * sqrt(log(1/delta)/(2*n))
+where n = number of calibration cases.
+
+Decision rule:
+- Green if BDS_all bootstrap_LCB > 0
+- Low-only if BDS_low bootstrap_LCB > 0 and BDS_all_LCB <= 0
+- Reject if BDS_low_LCB <= 0
+- Need-more-calibration if calibration cases < 5 or intervals too wide
+
+Outputs:
+- tables/tableA_unilumos_bds_by_split.csv
+- tables/tableA_unilumos_bds_by_split.md
+- reports/01_bds_split_summary.md
+
+Columns:
+- split_name
+- tset_name = low/all
+- calibration_cases
+- calibration_mean_gain
+- calibration_bootstrap_lcb95
+- calibration_bootstrap_ci95
+- calibration_win_rate
+- calibration_hoeffding_lcb95
+- predicted_verdict
+- holdout_cases
+- holdout_mean_gain
+- holdout_win_rate
+- holdout_confirms_prediction
+- notes
+
+Expected prior behavior:
+- low likely positive
+- all may be weak/mixed
+- final verdict may be Low-only / Mixed
+
+============================================================
+PHASE 4 — Model-level BDS row
+============================================================
+
+Aggregate across splits.
+
+Create:
+tables/cross_model_bds_row.csv
+tables/cross_model_bds_row.md
+
+Columns:
+- model_id = UniLumos
+- modality = video
+- task = relighting
+- protocol = official_demos
+- mode = abc
+- reference_method = reference_uniform25
+- reference_nfe = 25
+- cases = 20
+- tested_nfe_points
+- bds_low_mean_over_splits
+- bds_low_lcb_min_over_splits
+- bds_all_mean_over_splits
+- bds_all_lcb_min_over_splits
+- holdout_low_mean_gain_mean_over_splits
+- holdout_all_mean_gain_mean_over_splits
+- holdout_confirmation_rate
+- predicted_deployment
+- final_verdict
+- notes
+
+Expected final verdict:
+- Low-only / Mixed, if current observed behavior holds
+
+============================================================
+PHASE 5 — Optional comparison to full-run summary
+============================================================
+
+Read existing cross_model_summary_row if available.
+
+Compare:
+- full-run BCG / mean_rgb_delta
+- full-run win rate
+- BDS prediction
 
 Write:
-- `tables/tableC_calibration_holdout_policy_selection.csv`
-- `tables/tableC_calibration_holdout_policy_selection.md`
-- `reports/02_calibration_holdout_summary.md`
+tables/tableB_bds_vs_full_summary.csv
+tables/tableB_bds_vs_full_summary.md
 
-Key question:
-Can a calibration set discover that UniLumos should not use BSS at high NFE?
-
-============================================================
-PHASE 5 — Threshold / matched-quality certificate
-============================================================
-
-Read existing matched-quality table if available, or recompute.
-
-For RGB-L1 closure thresholds:
-- 0.50
-- 0.70
-- 0.80
-
-Report whether:
-- uniform reaches threshold
-- BSS reaches threshold
-- BSS reaches threshold at lower NFE than uniform
-- BSS not reached
-
-Write:
-- `tables/tableD_matched_quality_certificate.csv`
-- `tables/tableD_matched_quality_certificate.md`
-
-Expected:
-- BSS not reached for 50/70/80 on UniLumos.
-- Report this honestly.
+Columns:
+- model_id
+- bds_predicted_deployment
+- full_mean_rgb_delta
+- full_win_rate
+- full_low_gain
+- full_high_gain
+- matched_quality_status
+- prediction_consistent_with_full_result
 
 ============================================================
-PHASE 6 — Final UniLumos policy certificate report
+PHASE 6 — Final report
 ============================================================
 
 Create:
-
-`bss_experiments/unilumos_policy_certificate_v1/reports/FINAL_UNILUMOS_POLICY_CERTIFICATE_REPORT.md`
+bss_experiments/unilumos_bds_certificate_v1/reports/FINAL_UNILUMOS_BDS_CERTIFICATE_REPORT.md
 
 Include:
 1. Purpose
-2. Available artifact audit
-3. Same-compute statistical certificate
-4. Deployment policy selection
-5. Calibration/holdout results
-6. Matched-quality certificate
-7. Final verdict:
-   - Green / Yellow / Red for BSS-all
-   - Green / Yellow / Red for BSS-low-only
-8. Interpretation:
-   - UniLumos shows low-compute BSS benefit;
-   - BSS-all should not be deployed;
-   - matched-quality compute saving is not certified;
-   - PC-SMO/official diagnostics prevent overclaiming and can reject bad schedules.
-9. Caveats:
-   - official demos only
-   - reference_uniform25
-   - NFE as compute proxy
-   - no universal conclusion
-10. Recommended next experiment:
-   - solver-coordinate ablation
-   - sample_shift ablation
-   - Model C
+2. Why BDS is non-post-hoc
+3. Artifact audit
+4. Same-compute gain table summary
+5. Calibration/holdout splits
+6. BDS-low and BDS-all results
+7. Holdout verification
+8. Comparison with full-run summary
+9. Final UniLumos deployment verdict
+10. Caveats:
+    - official demos only
+    - RGB-L1 closure to reference_uniform25
+    - NFE as compute proxy
+    - no universal claim
+11. Recommended next experiment:
+    - solver-coordinate ablation
+    - sample_shift ablation
+    - Model C
 
-Suggested wording if results match current observations:
-“UniLumos receives a Yellow certificate: BSS improves low-compute same-NFE quality, but BSS-all is not supported and matched-quality NFE saving is not certified. The selected deployment policy is likely low-only or calibration-dependent.”
+Suggested wording if results match prior UniLumos behavior:
+“UniLumos receives a Low-only / Mixed certificate: a small calibration set predicts low-NFE BSS benefit but does not certify BSS deployment across the full tested compute range. This matches the full official-demo result where BSS improves at low compute but becomes unstable at high compute.”
 
 Final response should include:
 - artifact audit path
-- same-compute certificate table path
-- deployment policy table path
-- calibration/holdout table path
-- matched-quality certificate table path
+- same-compute gain table path
+- BDS split table path
+- cross_model_bds_row path
+- BDS vs full summary path
 - final report path
-- verdict for BSS-all
-- verdict for low-only BSS
-- selected policy
-- any missing data or limitations
+- final verdict
+- whether holdout confirms calibration prediction
 
 Do not push unless asked.
